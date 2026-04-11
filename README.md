@@ -14,6 +14,7 @@ AI-powered proposal analysis pipeline built with FastAPI.
 ✅ 1. Open project
 cd C:\Users\ubcas\Desktop\YangtzeDeltaApplication
 code .
+python -c "import fastapi" #If no error → everything is ready
 🎯 ✅ 2. Make sure environment is ready (ONE TIME CHECK)
 
 👉 .env exists and contains:
