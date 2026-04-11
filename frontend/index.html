@@ -1,0 +1,945 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>YangtzeDelta · Proposal Analyser</title>
+
+  <!-- marked.js for Markdown rendering -->
+  <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
+
+  <style>
+    /* ── Reset & base ──────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #f1f5f9;
+      --surface:   #ffffff;
+      --card:      #ffffff;
+      --border:    #e2e8f0;
+      --accent:    #3b82f6;
+      --accent2:   #6366f1;
+      --success:   #16a34a;
+      --warn:      #d97706;
+      --danger:    #dc2626;
+      --text:      #1e293b;
+      --muted:     #64748b;
+      --radius:    12px;
+    }
+
+    html { font-size: 16px; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    /* ── Header ────────────────────────────────────────────────────── */
+    header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 0 2rem;
+      height: 60px;
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    .logo {
+      font-size: 1.2rem;
+      font-weight: 700;
+      background: linear-gradient(90deg, var(--accent), var(--accent2));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      letter-spacing: -0.5px;
+    }
+    .logo-sub { font-size: .8rem; color: var(--muted); font-weight: 400; }
+
+    /* ── Layout ─────────────────────────────────────────────────────── */
+    .page {
+      flex: 1;
+      max-width: 920px;
+      width: 100%;
+      margin: 0 auto;
+      padding: 2.5rem 1.5rem 4rem;
+      display: flex;
+      flex-direction: column;
+      gap: 2rem;
+    }
+
+    /* ── Card ───────────────────────────────────────────────────────── */
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 2rem;
+    }
+    .card-title {
+      font-size: 1rem;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      margin-bottom: 1.25rem;
+    }
+
+    /* ── Upload zone ────────────────────────────────────────────────── */
+    #drop-zone {
+      border: 2px dashed var(--border);
+      border-radius: var(--radius);
+      padding: 3rem 2rem;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color .2s, background .2s;
+    }
+    #drop-zone:hover, #drop-zone.drag-over {
+      border-color: var(--accent);
+      background: rgba(59,130,246,.05);
+    }
+    #drop-zone .icon {
+      font-size: 2.5rem;
+      margin-bottom: .75rem;
+    }
+    #drop-zone p { color: var(--muted); font-size: .95rem; line-height: 1.6; }
+    #drop-zone strong { color: var(--text); }
+    #file-input { display: none; }
+
+    /* file badge */
+    #file-badge {
+      display: none;
+      align-items: center;
+      gap: .75rem;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: .75rem 1rem;
+      margin-top: 1rem;
+    }
+    #file-badge .file-icon { font-size: 1.5rem; }
+    #file-badge .file-name { font-weight: 500; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #file-badge .file-size { color: var(--muted); font-size: .85rem; white-space: nowrap; }
+    #remove-file { background: none; border: none; cursor: pointer; color: var(--muted); font-size: 1.1rem; padding: 0 4px; }
+    #remove-file:hover { color: var(--danger); }
+
+    /* ── Submit button ──────────────────────────────────────────────── */
+    #submit-btn {
+      display: block;
+      width: 100%;
+      margin-top: 1.5rem;
+      padding: 1rem;
+      font-size: 1rem;
+      font-weight: 600;
+      border: none;
+      border-radius: var(--radius);
+      cursor: pointer;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      color: #fff;
+      transition: opacity .2s, transform .1s;
+      letter-spacing: .02em;
+    }
+    #submit-btn:hover:not(:disabled) { opacity: .9; transform: translateY(-1px); }
+    #submit-btn:disabled { opacity: .45; cursor: not-allowed; transform: none; }
+
+    /* ── Email row ──────────────────────────────────────────────────── */
+    .email-row {
+      margin-top: 1.25rem;
+      display: flex;
+      flex-direction: column;
+      gap: .45rem;
+    }
+    .email-input-wrap {
+      display: flex;
+      gap: .5rem;
+    }
+    .email-row input[type="email"] {
+      flex: 1;
+      padding: .65rem .9rem;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font-size: .95rem;
+      color: var(--text);
+      background: var(--surface);
+      outline: none;
+      transition: border-color .2s;
+    }
+    .email-row input[type="email"]:focus { border-color: var(--accent); }
+    .email-hint { font-size: .8rem; color: var(--muted); line-height: 1.5; }
+    .btn-notify {
+      padding: .65rem 1.1rem;
+      border: none;
+      border-radius: 8px;
+      font-size: .88rem;
+      font-weight: 600;
+      cursor: pointer;
+      background: var(--accent);
+      color: #fff;
+      white-space: nowrap;
+      transition: opacity .18s, background .2s;
+    }
+    .btn-notify:hover { opacity: .88; }
+    .btn-notify.saved { background: var(--success); }
+    .btn-notify:disabled { opacity: .45; cursor: not-allowed; }
+
+    /* inline email bar on progress card */
+    .email-bar {
+      margin-top: 1.25rem;
+      padding-top: 1.25rem;
+      border-top: 1px solid var(--border);
+    }
+    .email-bar-label {
+      font-size: .8rem;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      margin-bottom: .5rem;
+    }
+
+    /* ── Progress ───────────────────────────────────────────────────── */
+    #progress-section { display: none; }
+
+    .progress-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 1.25rem;
+    }
+    .progress-title { font-size: 1.05rem; font-weight: 600; }
+    .status-pill {
+      font-size: .78rem;
+      font-weight: 600;
+      padding: .25rem .75rem;
+      border-radius: 99px;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+    }
+    .pill-running  { background: rgba(59,130,246,.12);  color: var(--accent); }
+    .pill-done     { background: rgba(22,163,74,.12);   color: var(--success); }
+    .pill-error    { background: rgba(220,38,38,.12);   color: var(--danger); }
+    .pill-queued   { background: rgba(100,116,139,.12); color: var(--muted); }
+
+    /* steps list */
+    .steps { display: flex; flex-direction: column; gap: .5rem; }
+    .step {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      padding: .75rem 1rem;
+      border-radius: 8px;
+      background: var(--surface);
+      border: 1px solid transparent;
+      transition: border-color .2s;
+    }
+    .step.running  { border-color: var(--accent); }
+    .step.done     { border-color: rgba(22,163,74,.35); }
+    .step.error    { border-color: rgba(220,38,38,.35); }
+
+    .step-icon-wrap { display: flex; flex-direction: column; align-items: center; flex-shrink: 0; width: 2.2rem; }
+    .step-icon { font-size: 1.1rem; width: 1.4rem; text-align: center; }
+    .step-pct { font-size: .65rem; font-weight: 700; color: var(--accent); margin-top: 1px; line-height: 1; }
+    .step-label { flex: 1; font-size: .92rem; }
+    .step-label .label-text { font-weight: 500; }
+    .step-label .label-error { font-size: .78rem; color: var(--danger); margin-top: .2rem; }
+    .step-time { font-size: .78rem; color: var(--muted); white-space: nowrap; }
+
+    /* circular progress ring */
+    .ring-bg  { stroke: var(--border); }
+    .ring-fg  { stroke: var(--accent); transition: stroke-dasharray .4s ease; stroke-linecap: round; }
+
+    /* spinner */
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .spinner {
+      width: 16px; height: 16px;
+      border: 2px solid transparent;
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin .7s linear infinite;
+      display: inline-block;
+    }
+
+    /* overall progress bar */
+    .progress-bar-wrap {
+      height: 4px;
+      background: var(--border);
+      border-radius: 99px;
+      margin-bottom: 1.25rem;
+      overflow: hidden;
+    }
+    .progress-bar-fill {
+      height: 100%;
+      border-radius: 99px;
+      background: linear-gradient(90deg, var(--accent), var(--accent2));
+      transition: width .4s ease;
+      width: 0%;
+    }
+
+    /* ── Error alert ─────────────────────────────────────────────────── */
+    #error-alert {
+      display: none;
+      background: #fef2f2;
+      border: 1px solid #fecaca;
+      border-radius: var(--radius);
+      padding: 1rem 1.25rem;
+      color: #b91c1c;
+      font-size: .9rem;
+      white-space: pre-wrap;
+      font-family: monospace;
+    }
+
+    /* ── Report section ──────────────────────────────────────────────── */
+    #report-section { display: none; }
+
+    .report-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 1.5rem;
+      gap: 1rem;
+      flex-wrap: wrap;
+    }
+    .report-toolbar h2 { font-size: 1.1rem; font-weight: 700; }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: .4rem;
+      padding: .55rem 1.1rem;
+      border-radius: 8px;
+      font-size: .88rem;
+      font-weight: 600;
+      cursor: pointer;
+      border: none;
+      transition: opacity .18s, transform .1s;
+    }
+    .btn:hover { opacity: .85; transform: translateY(-1px); }
+    .btn-download {
+      background: var(--success);
+      color: #fff;
+    }
+    .btn-new {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text);
+    }
+
+    /* Markdown styles */
+    #report-body {
+      line-height: 1.75;
+      color: var(--text);
+      font-size: .97rem;
+    }
+    #report-body h1 {
+      font-size: 1.6rem; font-weight: 800;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: .5rem; margin: 1.5rem 0 1rem;
+    }
+    #report-body h2 {
+      font-size: 1.25rem; font-weight: 700;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: .3rem; margin: 1.5rem 0 .75rem;
+      color: #1d4ed8;
+    }
+    #report-body h3 {
+      font-size: 1.05rem; font-weight: 600;
+      margin: 1.25rem 0 .5rem; color: #4338ca;
+    }
+    #report-body h4 {
+      font-size: .95rem; font-weight: 600;
+      margin: 1rem 0 .4rem; color: var(--muted);
+    }
+    #report-body p  { margin-bottom: .75rem; }
+    #report-body ul, #report-body ol { padding-left: 1.5rem; margin-bottom: .75rem; }
+    #report-body li { margin-bottom: .3rem; }
+    #report-body blockquote {
+      border-left: 3px solid var(--accent);
+      padding: .5rem 1rem;
+      margin: .75rem 0;
+      background: rgba(59,130,246,.06);
+      border-radius: 0 6px 6px 0;
+      color: var(--muted);
+      font-size: .92rem;
+    }
+    #report-body code {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: .1em .4em;
+      font-size: .88em;
+      font-family: "SF Mono", monospace;
+    }
+    #report-body pre {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1rem;
+      overflow-x: auto;
+      margin-bottom: 1rem;
+    }
+    #report-body pre code { background: none; border: none; padding: 0; }
+    #report-body strong { color: #0f172a; }
+    #report-body em { color: var(--muted); }
+    #report-body hr {
+      border: none; border-top: 1px solid var(--border);
+      margin: 1.5rem 0;
+    }
+    #report-body table {
+      width: 100%; border-collapse: collapse; margin-bottom: 1rem;
+      font-size: .9rem;
+    }
+    #report-body th, #report-body td {
+      border: 1px solid var(--border);
+      padding: .45rem .75rem;
+      text-align: left;
+    }
+    #report-body th { background: var(--surface); font-weight: 600; }
+
+    /* ── Footer ─────────────────────────────────────────────────────── */
+    footer {
+      text-align: center;
+      color: var(--muted);
+      font-size: .8rem;
+      padding: 1.5rem;
+      border-top: 1px solid var(--border);
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <div>
+    <span class="logo">YangtzeDelta</span>
+    <span class="logo-sub"> · Proposal AI Analyser</span>
+  </div>
+</header>
+
+<main class="page">
+
+  <!-- ── Upload card ──────────────────────────────────────────────────── -->
+  <div class="card" id="upload-card">
+    <div class="card-title">Upload Proposal</div>
+
+    <div id="drop-zone">
+      <div class="icon">📄</div>
+      <p>
+        <strong>Drag & drop your proposal file here</strong><br>
+        or <a id="browse-link" href="#">browse to upload</a>
+      </p>
+      <p style="margin-top:.5rem;font-size:.82rem;">PDF, DOCX, PPTX, TXT, MD · Any size</p>
+    </div>
+    <input type="file" id="file-input" accept=".pdf,.docx,.doc,.txt,.md,.pptx,.ppt" />
+
+    <div id="file-badge">
+      <span class="file-icon" id="badge-icon">📄</span>
+      <span class="file-name" id="badge-name"></span>
+      <span class="file-size" id="badge-size"></span>
+      <button id="remove-file" title="Remove file">✕</button>
+    </div>
+
+    <div class="email-row">
+      <div class="email-input-wrap">
+        <input type="email" id="email-input" placeholder="your@email.com (optional)"
+               autocomplete="email" />
+        <button type="button" class="btn-notify" id="notify-btn" disabled>Notify me</button>
+      </div>
+      <p class="email-hint" id="upload-email-hint">
+        Get the report in your inbox — you can safely close this tab after starting.
+      </p>
+    </div>
+
+    <button id="submit-btn" disabled>Analyse Proposal</button>
+  </div>
+
+  <!-- ── Progress card ────────────────────────────────────────────────── -->
+  <div class="card" id="progress-section">
+    <div class="progress-header">
+      <span class="progress-title">Pipeline Progress</span>
+      <span class="status-pill pill-queued" id="status-pill">Queued</span>
+    </div>
+    <div style="display:flex;align-items:center;gap:.75rem;margin-bottom:1.25rem;">
+      <div class="progress-bar-wrap" style="flex:1;margin-bottom:0;">
+        <div class="progress-bar-fill" id="progress-bar"></div>
+      </div>
+      <span id="progress-pct" style="font-size:.85rem;font-weight:700;color:var(--accent);white-space:nowrap;min-width:2.8rem;text-align:right;">0%</span>
+    </div>
+    <div class="steps" id="steps-list"></div>
+
+  </div>
+
+  <!-- ── Error ─────────────────────────────────────────────────────────── -->
+  <div id="error-alert"></div>
+
+  <!-- ── Report ────────────────────────────────────────────────────────── -->
+  <div class="card" id="report-section">
+    <div class="report-toolbar">
+      <h2>📋 Final Report</h2>
+      <div style="display:flex;gap:.6rem;">
+        <button class="btn btn-download" id="download-btn">⬇ Download .md</button>
+        <button class="btn btn-new" id="new-btn">＋ New Analysis</button>
+      </div>
+    </div>
+    <div id="report-body"></div>
+  </div>
+
+</main>
+
+<footer>YangtzeDelta Proposal Analyser · Powered by AI</footer>
+
+<script>
+/* ── State ──────────────────────────────────────────────────────────────── */
+let selectedFile  = null;
+let currentJobId  = null;
+let currentPid    = null;
+let evtSource     = null;
+let lastJob       = null;
+let tickTimer     = null;
+
+/* ── DOM refs ───────────────────────────────────────────────────────────── */
+const dropZone      = document.getElementById('drop-zone');
+const fileInput     = document.getElementById('file-input');
+const browseLink    = document.getElementById('browse-link');
+const fileBadge     = document.getElementById('file-badge');
+const badgeIcon     = document.getElementById('badge-icon');
+const badgeName     = document.getElementById('badge-name');
+const badgeSize     = document.getElementById('badge-size');
+const removeFile    = document.getElementById('remove-file');
+const submitBtn     = document.getElementById('submit-btn');
+
+const uploadCard    = document.getElementById('upload-card');
+const progressSect  = document.getElementById('progress-section');
+const statusPill    = document.getElementById('status-pill');
+const progressBar   = document.getElementById('progress-bar');
+const progressPct   = document.getElementById('progress-pct');
+const stepsList     = document.getElementById('steps-list');
+
+const errorAlert    = document.getElementById('error-alert');
+
+const notifyBtn       = document.getElementById('notify-btn');
+const uploadEmailHint = document.getElementById('upload-email-hint');
+const emailInput      = document.getElementById('email-input');
+
+const reportSect    = document.getElementById('report-section');
+const reportBody    = document.getElementById('report-body');
+const downloadBtn   = document.getElementById('download-btn');
+const newBtn        = document.getElementById('new-btn');
+
+const STEP_LABELS = [
+  "Extracting text from document",
+  "Extracting key facts",
+  "Building analysis dimensions",
+  "Generating evaluation questions",
+  "Running LLM analysis",
+  "Post-processing answers",
+  "Generating expert opinion",
+  "Compiling final report",
+];
+const TOTAL_STEPS = STEP_LABELS.length;
+
+/* ── File helpers ───────────────────────────────────────────────────────── */
+function fmtSize(bytes) {
+  if (bytes < 1024)      return `${bytes} B`;
+  if (bytes < 1048576)   return `${(bytes/1024).toFixed(1)} KB`;
+  return `${(bytes/1048576).toFixed(1)} MB`;
+}
+
+function extIcon(name) {
+  const ext = name.split('.').pop().toLowerCase();
+  return { pdf:'📕', docx:'📘', doc:'📘', txt:'📄', md:'📝', pptx:'📊', ppt:'📊' }[ext] || '📄';
+}
+
+function setFile(file) {
+  selectedFile = file;
+  badgeIcon.textContent = extIcon(file.name);
+  badgeName.textContent  = file.name;
+  badgeSize.textContent  = fmtSize(file.size);
+  fileBadge.style.display = 'flex';
+  submitBtn.disabled      = false;
+}
+
+function clearFile() {
+  selectedFile = null;
+  fileInput.value = '';
+  fileBadge.style.display = 'none';
+  submitBtn.disabled = true;
+}
+
+/* ── Drag & drop ────────────────────────────────────────────────────────── */
+browseLink.addEventListener('click', e => { e.preventDefault(); e.stopPropagation(); fileInput.click(); });
+dropZone.addEventListener('click', () => fileInput.click());
+
+fileInput.addEventListener('change', () => {
+  if (fileInput.files[0]) setFile(fileInput.files[0]);
+});
+
+['dragenter','dragover'].forEach(evt =>
+  dropZone.addEventListener(evt, e => { e.preventDefault(); dropZone.classList.add('drag-over'); })
+);
+['dragleave','drop'].forEach(evt =>
+  dropZone.addEventListener(evt, e => { e.preventDefault(); dropZone.classList.remove('drag-over'); })
+);
+dropZone.addEventListener('drop', e => {
+  const f = e.dataTransfer.files[0];
+  if (f) setFile(f);
+});
+
+removeFile.addEventListener('click', clearFile);
+
+/* ── Pipeline UI helpers ─────────────────────────────────────────────────── */
+function ringHTML(pct) {
+  const p = Math.max(0, Math.min(100, pct));
+  return `<svg viewBox="0 0 36 36" width="30" height="30">
+    <circle class="ring-bg" cx="18" cy="18" r="15.9" fill="none" stroke-width="3.2"/>
+    <circle class="ring-fg" cx="18" cy="18" r="15.9" fill="none" stroke-width="3.2"
+      stroke-dasharray="${p} 100" stroke-dashoffset="25"/>
+  </svg>`;
+}
+
+function buildStepRow(label, status) {
+  const el = document.createElement('div');
+  el.className = `step ${status}`;
+  let icon = status === 'done' ? '✅' : status === 'error' ? '❌' : '○';
+
+  el.innerHTML = `
+    <div class="step-icon-wrap">
+      <span class="step-icon">${icon}</span>
+      <span class="step-pct"></span>
+    </div>
+    <span class="step-label">
+      <div class="label-text">${label}</div>
+    </span>
+    <span class="step-time"></span>`;
+  return el;
+}
+
+function initStepsUI() {
+  stepsList.innerHTML = '';
+  STEP_LABELS.forEach(label => {
+    stepsList.appendChild(buildStepRow(label, 'pending'));
+  });
+}
+
+function updateStepRow(i, step) {
+  const row = stepsList.children[i];
+  if (!row) return;
+  row.className = `step ${step.status}`;
+
+  const iconEl  = row.querySelector('.step-icon');
+  const pctEl   = row.querySelector('.step-pct');
+  const timeEl  = row.querySelector('.step-time');
+  const errEl   = row.querySelector('.label-error');
+
+  if (step.status === 'running') {
+    const sp = step.sub_progress;
+    if (sp && sp.total > 0) {
+      const pct = Math.round((sp.done / sp.total) * 100);
+      iconEl.innerHTML = ringHTML(pct);
+      pctEl.textContent = `${pct}%`;
+    } else {
+      iconEl.innerHTML = '<span class="spinner"></span>';
+      pctEl.textContent = '';
+    }
+  } else if (step.status === 'done') {
+    iconEl.textContent = '✅';
+    pctEl.textContent = '';
+  } else if (step.status === 'error') {
+    iconEl.textContent = '❌';
+    pctEl.textContent = '';
+  } else {
+    iconEl.textContent = '○';
+    pctEl.textContent = '';
+  }
+
+  // elapsed / finished time
+  if (step.started_at && step.finished_at) {
+    const secs = Math.round((new Date(step.finished_at) - new Date(step.started_at)) / 1000);
+    timeEl.textContent = `${secs}s`;
+  } else if (step.started_at && step.status === 'running') {
+    const elapsed = Math.round((Date.now() - new Date(step.started_at)) / 1000);
+    timeEl.textContent = `${elapsed}s`;
+  } else {
+    timeEl.textContent = '';
+  }
+
+  // error detail
+  if (step.error && !errEl) {
+    const d = document.createElement('div');
+    d.className = 'label-error';
+    d.textContent = step.error.slice(0, 200);
+    row.querySelector('.step-label').appendChild(d);
+  }
+}
+
+function setPill(status) {
+  statusPill.className = 'status-pill';
+  const map = { running:'pill-running', done:'pill-done', error:'pill-error', queued:'pill-queued' };
+  statusPill.classList.add(map[status] || 'pill-queued');
+  statusPill.textContent = status.toUpperCase();
+}
+
+function setProgress(done, total) {
+  const pct = Math.round((done / total) * 100);
+  progressBar.style.width = `${pct}%`;
+  progressPct.textContent = `${pct}%`;
+}
+
+/* ── Email notify button (upload card) ───────────────────────────────────── */
+emailInput.addEventListener('input', () => {
+  notifyBtn.disabled = !emailInput.validity.valid || !emailInput.value.trim();
+  notifyBtn.classList.remove('saved');
+  notifyBtn.textContent = 'Notify me';
+  uploadEmailHint.textContent = "Get the report in your inbox — you can safely close this tab after starting.";
+  uploadEmailHint.style.color = '';
+});
+
+notifyBtn.addEventListener('click', () => {
+  const val = emailInput.value.trim();
+  if (!emailInput.validity.valid || !val) return;
+  localStorage.setItem('yd_email', val);
+  notifyBtn.classList.add('saved');
+  notifyBtn.textContent = '✓ Done';
+  uploadEmailHint.innerHTML = `✅ Got it! Once the analysis is complete, the full report will be sent to <strong>${val}</strong>. You can safely close this tab — we'll deliver it to your inbox.`;
+  uploadEmailHint.style.color = 'var(--success)';
+});
+
+/* ── Submit ──────────────────────────────────────────────────────────────── */
+submitBtn.addEventListener('click', async () => {
+  if (!selectedFile) return;
+  await startAnalysis();
+});
+
+async function startAnalysis() {
+  // reset UI
+  errorAlert.style.display  = 'none';
+  reportSect.style.display  = 'none';
+  progressSect.style.display = 'block';
+  submitBtn.disabled = true;
+  initStepsUI();
+  setProgress(0, TOTAL_STEPS);
+  progressPct.textContent = '0%';
+  setPill('queued');
+
+  // 1) upload
+  const form = new FormData();
+  form.append('file', selectedFile);
+  const emailVal = document.getElementById('email-input').value.trim();
+  if (emailVal) form.append('email', emailVal);
+
+  let uploadResp;
+  try {
+    const r = await fetch('/api/upload', { method: 'POST', body: form });
+    if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+    uploadResp = await r.json();
+  } catch (err) {
+    showError(`Upload failed: ${err.message}`);
+    return;
+  }
+
+  currentJobId = uploadResp.job_id;
+  currentPid   = uploadResp.pid;
+  localStorage.setItem('yd_job_id', currentJobId);
+  history.replaceState(null, '', `#job=${currentJobId}`);
+  if (emailVal) localStorage.setItem('yd_email', emailVal);
+
+  // 2) trigger run
+  try {
+    const r = await fetch(`/api/run/${currentJobId}`, { method: 'POST' });
+    if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+  } catch (err) {
+    showError(`Failed to start pipeline: ${err.message}`);
+    return;
+  }
+
+  // 3) subscribe to SSE
+  listenSSE(currentJobId);
+}
+
+function startElapsedTicker() {
+  if (tickTimer) clearInterval(tickTimer);
+  tickTimer = setInterval(() => {
+    if (!lastJob) return;
+    (lastJob.steps || []).forEach((step, i) => {
+      if (step.status !== 'running' || !step.started_at) return;
+      const row = stepsList.children[i];
+      if (!row) return;
+      const timeEl = row.querySelector('.step-time');
+      const elapsed = Math.round((Date.now() - new Date(step.started_at)) / 1000);
+      timeEl.textContent = `${elapsed}s`;
+    });
+  }, 1000);
+}
+
+function listenSSE(jobId) {
+  if (evtSource) evtSource.close();
+  evtSource = new EventSource(`/api/events/${jobId}`);
+
+  evtSource.onmessage = (e) => {
+    const job = JSON.parse(e.data);
+    lastJob = job;
+    renderJob(job);
+    if (job.status === 'done' || job.status === 'error') {
+      evtSource.close();
+      if (tickTimer) { clearInterval(tickTimer); tickTimer = null; }
+      clearJobSession();
+    }
+  };
+
+  evtSource.onerror = () => {
+    evtSource.close();
+    // fallback: poll
+    pollStatus(jobId);
+  };
+  startElapsedTicker();
+}
+
+function pollStatus(jobId) {
+  startElapsedTicker();
+  const interval = setInterval(async () => {
+    try {
+      const r = await fetch(`/api/status/${jobId}`);
+      const job = await r.json();
+      lastJob = job;
+      renderJob(job);
+      if (job.status === 'done' || job.status === 'error') {
+        clearInterval(interval);
+        if (tickTimer) { clearInterval(tickTimer); tickTimer = null; }
+        clearJobSession();
+      }
+    } catch (_) {}
+  }, 1500);
+}
+
+function renderJob(job) {
+  setPill(job.status);
+
+  const steps = job.steps || [];
+  let doneCount = 0;
+  steps.forEach((s, i) => {
+    updateStepRow(i, s);
+    if (s.status === 'done') doneCount++;
+    if (s.status === 'running') doneCount += 0.5;
+  });
+  setProgress(doneCount, TOTAL_STEPS);
+
+  if (job.status === 'error') {
+    showError(job.error || 'An unknown error occurred.');
+    submitBtn.disabled = false;
+  }
+
+  if (job.status === 'done') {
+    loadReport(job.job_id);
+  }
+}
+
+/* ── Report ──────────────────────────────────────────────────────────────── */
+async function loadReport(jobId) {
+  try {
+    const r = await fetch(`/api/report/${jobId}`);
+    if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+    const data = await r.json();
+
+    reportBody.innerHTML = marked.parse(data.markdown);
+    reportSect.style.display = 'block';
+    reportSect.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } catch (err) {
+    showError(`Could not load report: ${err.message}`);
+  }
+}
+
+downloadBtn.addEventListener('click', () => {
+  if (currentJobId) window.location.href = `/api/download/${currentJobId}`;
+});
+
+newBtn.addEventListener('click', () => {
+  // reset everything
+  if (evtSource) evtSource.close();
+  if (tickTimer) { clearInterval(tickTimer); tickTimer = null; }
+  lastJob      = null;
+  currentJobId = null;
+  currentPid   = null;
+  clearJobSession();
+  clearFile();
+  document.getElementById('email-input').value = '';
+  localStorage.removeItem('yd_email');
+  notifyBtn.disabled = true;
+  notifyBtn.classList.remove('saved');
+  notifyBtn.textContent = 'Notify me';
+  uploadEmailHint.textContent = "Get the report in your inbox — you can safely close this tab after starting.";
+  uploadEmailHint.style.color = '';
+  progressSect.style.display  = 'none';
+  reportSect.style.display    = 'none';
+  errorAlert.style.display    = 'none';
+  submitBtn.disabled          = true;
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+});
+
+/* ── Error ───────────────────────────────────────────────────────────────── */
+function showError(msg) {
+  errorAlert.textContent  = msg;
+  errorAlert.style.display = 'block';
+}
+
+/* ── Session persistence ─────────────────────────────────────────────────── */
+function restoreEmail() {
+  const saved = localStorage.getItem('yd_email');
+  if (!saved) return;
+  emailInput.value = saved;
+  notifyBtn.disabled = false;
+  notifyBtn.classList.add('saved');
+  notifyBtn.textContent = '✓ Done';
+  uploadEmailHint.innerHTML = `✅ Got it! Once the analysis is complete, the full report will be sent to <strong>${saved}</strong>. You can safely close this tab — we'll deliver it to your inbox.`;
+  uploadEmailHint.style.color = 'var(--success)';
+}
+
+function clearJobSession() {
+  localStorage.removeItem('yd_job_id');
+  history.replaceState(null, '', location.pathname);
+}
+
+async function recoverSession() {
+  // prefer URL hash, fall back to localStorage
+  const hashParam = new URLSearchParams(location.hash.replace(/^#/, '')).get('job');
+  const savedId   = hashParam || localStorage.getItem('yd_job_id');
+  if (!savedId) return;
+
+  let job;
+  try {
+    const r = await fetch(`/api/status/${savedId}`);
+    if (!r.ok) { clearJobSession(); return; }
+    job = await r.json();
+  } catch (_) { clearJobSession(); return; }
+
+  // terminal states that finished before the tab closed — show final UI
+  if (job.status === 'done' || job.status === 'error') {
+    clearJobSession();
+    currentJobId = savedId;
+    currentPid   = job.pid;
+    progressSect.style.display = 'block';
+    initStepsUI();
+    renderJob(job);
+    return;
+  }
+
+  // job still running — reconnect
+  currentJobId = savedId;
+  currentPid   = job.pid;
+  localStorage.setItem('yd_job_id', savedId);
+  history.replaceState(null, '', `#job=${savedId}`);
+  progressSect.style.display = 'block';
+  submitBtn.disabled = true;
+  initStepsUI();
+  renderJob(job);
+  listenSSE(savedId);
+}
+
+restoreEmail();
+recoverSession();
+</script>
+</body>
+</html>
