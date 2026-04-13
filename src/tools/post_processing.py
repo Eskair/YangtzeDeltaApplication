@@ -288,7 +288,19 @@ DEFAULT_CONF = {
 }
 
 PUNC = set(string.punctuation + "，。；：！？、（）【】《》…—-·")
-DIM_ORDER = ["team", "objectives", "strategy", "innovation", "feasibility"]
+
+
+def _init_post_dim_order():
+    try:
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+        from src.config import get_config
+        return get_config().dimension_names
+    except Exception:
+        return ["team", "objectives", "strategy", "innovation", "feasibility"]
+
+
+DIM_ORDER = _init_post_dim_order()
 
 RE_DATE   = re.compile(r"\b(20\d{2}|19\d{2})([-/.]|年)\d{1,2}([-/\.日]|月)\d{1,2}\b|\b(Q[1-4]\s*-\s*20\d{2})\b", re.I)
 RE_MONEY  = re.compile(r"\b(\$|USD|EUR|CNY|RMB|CAD)\s*\d{2,}(,\d{3})*(\.\d+)?\b|\b\d+(\.\d+)?\s*(million|billion|万|亿)\b", re.I)

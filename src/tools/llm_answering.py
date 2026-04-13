@@ -52,7 +52,18 @@ PARSED_DIR = DATA_DIR / "parsed"
 CONFIG_QS_DEFAULT = DATA_DIR / "config" / "question_sets" / "generated_questions.json"
 OUT_REFINED = DATA_DIR / "refined_answers"
 
-DIM_ORDER = ["team", "objectives", "strategy", "innovation", "feasibility"]
+
+def _init_answering_dim_order():
+    try:
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from src.config import get_config
+        return get_config().dimension_names
+    except Exception:
+        return ["team", "objectives", "strategy", "innovation", "feasibility"]
+
+
+DIM_ORDER = _init_answering_dim_order()
 
 # ========== SDK ==========
 try:

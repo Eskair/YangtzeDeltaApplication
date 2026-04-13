@@ -558,54 +558,37 @@ def normalize_fact(
     # 先把已有维度放进一个 set，后面按 type / 文本内容补充
     dim_set = set(dims_clean)
 
-    # ===== 1. 通用 type→dimensions 映射（更激进版本，优先保证信息被多个维度看到） =====
-    if type_val in ["team_member", "org_structure"]:
-        # 团队成员 / 组织结构 → 明确归入 team
-        dim_set.add("team")
-
-    elif type_val == "collaboration":
-        # 协作既是团队协同，也是合作策略
-        dim_set.update(["team", "strategy"])
-
-    elif type_val == "pipeline":
-        # 管线：目标 + 路线，既体现 objectives，也体现 strategy
-        dim_set.update(["objectives", "strategy"])
-
-    elif type_val == "milestone":
-        # 里程碑：目标的阶段性拆分 + 执行可行性
-        dim_set.update(["objectives", "feasibility"])
-
-    elif type_val == "clinical_design":
-        # 临床设计：目标路径 + 方案策略 + 执行可行性
-        dim_set.update(["objectives", "strategy", "feasibility"])
-
-    elif type_val in ["market", "product"]:
-        # 市场 / 产品：商业策略 + 落地可行性
-        dim_set.update(["objectives", "strategy", "feasibility"])
-
-    elif type_val in ["tech_route", "regulatory"]:
-        # 技术路线 / 监管路径：典型 strategy，但对可行性也有影响
-        dim_set.update(["strategy", "feasibility"])
-
-    elif type_val == "funding_source":
-        # 资金来源：既体现策略布局，也影响可行性
-        dim_set.update(["strategy", "feasibility"])
-
-    elif type_val == "ip_asset":
-        # IP 资产：创新优势 + 中长期可行性
-        dim_set.update(["innovation", "feasibility"])
-
-    elif type_val == "evidence":
-        # 证据：创新价值 + 可行性（证据越强，可行性越高）
-        dim_set.update(["innovation", "feasibility"])
-
-    elif type_val == "ai_model":
-        # AI 模型既是创新亮点，也是策略的一部分
-        dim_set.update(["innovation", "strategy"])
-
-    elif type_val in ["resource", "budget_item", "risk", "mitigation"]:
-        # 资源、预算、风险与应对 → 可行性
-        dim_set.add("feasibility")
+    # ===== 1. Config-driven type→dimensions mapping =====
+    # Try the centralized config first; fall back to hardcoded rules
+    type_dims_map = _get_type_to_dims_map()
+    if type_dims_map and type_val in type_dims_map:
+        mapped = type_dims_map[type_val]
+        if mapped:
+            dim_set.update(mapped)
+    else:
+        # Hardcoded fallback (preserves original behavior)
+        _FALLBACK_TYPE_DIMS = {
+            "team_member": ["team"],
+            "org_structure": ["team"],
+            "collaboration": ["team", "strategy"],
+            "pipeline": ["objectives", "strategy"],
+            "milestone": ["objectives", "feasibility"],
+            "clinical_design": ["objectives", "strategy", "feasibility"],
+            "market": ["objectives", "strategy", "feasibility"],
+            "product": ["objectives", "strategy", "feasibility"],
+            "tech_route": ["strategy", "feasibility"],
+            "regulatory": ["strategy", "feasibility"],
+            "funding_source": ["strategy", "feasibility"],
+            "ip_asset": ["innovation", "feasibility"],
+            "evidence": ["innovation", "feasibility"],
+            "ai_model": ["innovation", "strategy"],
+            "resource": ["feasibility"],
+            "budget_item": ["feasibility"],
+            "risk": ["feasibility"],
+            "mitigation": ["feasibility"],
+        }
+        if type_val in _FALLBACK_TYPE_DIMS:
+            dim_set.update(_FALLBACK_TYPE_DIMS[type_val])
 
     # ===== 2. 如果还是没维度，用文本关键词再判断一轮 =====
     if not dim_set:
@@ -634,18 +617,15 @@ def normalize_fact(
     # ==== 计算 primary_dimension ====
     primary_dim = None
     if dims_final:
-        # 简单的优先级规则：尽量按内容来，不行就取第一个
-        # 你也可以自己按业务微调优先级
-        priority = ["team", "objectives", "strategy", "innovation", "feasibility"]
-        # 从 dims_final 里选出优先级最高的那一个
-        for d in priority:
+        for d in VALID_DIMENSIONS:
             if d in dims_final:
                 primary_dim = d
                 break
         if primary_dim is None:
             primary_dim = dims_final[0]
     else:
-        primary_dim = "feasibility"  # 理论上不会走到这里，因为上面兜底了
+        cfg = _get_domain_config()
+        primary_dim = cfg.fallback_dimension if cfg else "feasibility"
 
     return {
         "text": text.strip(),
