@@ -46,10 +46,35 @@ def _write_progress(done: int, total: int, pid: str = "") -> None:
     except Exception:
         pass
 
-DIMENSION_NAMES = ["team", "objectives", "strategy", "innovation", "feasibility"]
 
-# 全局 client 复用
-client = OpenAI()
+def _get_domain_config():
+    """Load dimension config from centralized config system."""
+    try:
+        import sys
+        sys.path.insert(0, str(BASE_DIR))
+        from src.config import get_config
+        return get_config()
+    except Exception:
+        return None
+
+
+def _get_dimension_names():
+    cfg = _get_domain_config()
+    if cfg:
+        return cfg.dimension_names
+    return ["team", "objectives", "strategy", "innovation", "feasibility"]
+
+
+DIMENSION_NAMES = _get_dimension_names()
+
+client = None  # lazy-initialized
+
+
+def _get_client():
+    global client
+    if client is None:
+        client = OpenAI()
+    return client
 
 # 注意：这里用 {dimension_name} 标记占位，其它所有 { } 都是字面量 JSON 示例
 # 后面用 .replace("{dimension_name}", xxx) 而不是 .format()
@@ -417,7 +442,7 @@ def call_llm_for_dimension(dimension_name: str, facts: List[Dict[str, Any]]) -> 
         },
     ]
 
-    resp = client.chat.completions.create(
+    resp = _get_client().chat.completions.create(
         model=OPENAI_MODEL,
         messages=messages,
         response_format={"type": "json_object"},

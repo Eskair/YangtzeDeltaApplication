@@ -21,8 +21,7 @@ from jinja2 import Environment, BaseLoader
 _PROMPTS_DIR = Path(__file__).resolve().parent
 _cache: Dict[str, Dict[str, Any]] = {}
 
-_jinja_env = Environment(loader=BaseLoader(), undefined=None)
-# Allow {{ and }} inside JSON examples by not stripping
+_jinja_env = Environment(loader=BaseLoader())
 _jinja_env.keep_trailing_newline = True
 
 

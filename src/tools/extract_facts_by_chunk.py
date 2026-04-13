@@ -53,31 +53,57 @@ def _write_progress(done: int, total: int, pid: str = "") -> None:
 
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-# 全局复用一个 OpenAI client，避免每个 chunk 反复初始化
-client = OpenAI()
+client = None  # lazy-initialized to avoid import-time side effects
 
-VALID_DIMENSIONS = ["team", "objectives", "strategy", "innovation", "feasibility"]
-VALID_TYPES = [
-    "team_member",
-    "org_structure",
-    "collaboration",
-    "resource",
-    "pipeline",
-    "milestone",
-    "market",
-    "tech_route",
-    "product",
-    "ip_asset",
-    "evidence",
-    "budget_item",
-    "funding_source",
-    "risk",
-    "mitigation",
-    "ai_model",
-    "clinical_design",
-    "regulatory",
-    "other",
-]
+
+def _get_client():
+    global client
+    if client is None:
+        client = OpenAI()
+    return client
+
+
+def _get_domain_config():
+    """Load dimension/type config from the centralized config system."""
+    try:
+        import sys
+        sys.path.insert(0, str(BASE_DIR))
+        from src.config import get_config
+        return get_config()
+    except Exception:
+        return None
+
+
+def _get_valid_dimensions():
+    cfg = _get_domain_config()
+    if cfg:
+        return cfg.valid_dimensions
+    return ["team", "objectives", "strategy", "innovation", "feasibility"]
+
+
+def _get_valid_types():
+    cfg = _get_domain_config()
+    if cfg:
+        return cfg.valid_types
+    return [
+        "team_member", "org_structure", "collaboration", "resource",
+        "pipeline", "milestone", "market", "tech_route", "product",
+        "ip_asset", "evidence", "budget_item", "funding_source",
+        "risk", "mitigation", "ai_model", "clinical_design",
+        "regulatory", "other",
+    ]
+
+
+def _get_type_to_dims_map():
+    cfg = _get_domain_config()
+    if cfg:
+        return cfg.get_type_to_dims_map()
+    return {}
+
+
+# Keep module-level references for backward compatibility
+VALID_DIMENSIONS = _get_valid_dimensions()
+VALID_TYPES = _get_valid_types()
 
 # ⚠️ Prompt：既要防幻觉，又要尽量“捞干净”五维相关信息，并保证多维覆盖
 FACT_PROMPT = """
@@ -285,7 +311,7 @@ def call_llm_for_chunk(chunk_text: str, attempt: int = 1, dense: bool = False) -
         },
     ]
 
-    resp = client.chat.completions.create(
+    resp = _get_client().chat.completions.create(
         model=OPENAI_MODEL,
         messages=messages,
         response_format={"type": "json_object"},

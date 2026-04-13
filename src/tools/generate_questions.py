@@ -66,15 +66,31 @@ def _write_progress(done: int, total: int, pid: str = "") -> None:
 QUESTIONS_DIR = DATA_DIR / "questions"
 CONFIG_QS_DIR = DATA_DIR / "config" / "question_sets"
 
-QUESTIONS_DIR.mkdir(parents=True, exist_ok=True)
-CONFIG_QS_DIR.mkdir(parents=True, exist_ok=True)
-
 # ========== LLM 配置 ==========
 
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 PROVIDER = os.getenv("PROVIDER", "openai").lower()
 
-DIMENSION_NAMES = ["team", "objectives", "strategy", "innovation", "feasibility"]
+
+def _get_domain_config():
+    """Load config from centralized config system."""
+    try:
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+        from src.config import get_config
+        return get_config()
+    except Exception:
+        return None
+
+
+def _get_dimension_names():
+    cfg = _get_domain_config()
+    if cfg:
+        return cfg.dimension_names
+    return ["team", "objectives", "strategy", "innovation", "feasibility"]
+
+
+DIMENSION_NAMES = _get_dimension_names()
 
 # 一些“平台/中长期视角”的 aspect id，用于简单 sanity check
 PLATFORM_ASPECT_IDS = {
