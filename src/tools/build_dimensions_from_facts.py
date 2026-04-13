@@ -166,9 +166,19 @@ payload = {
 
 
 def load_raw_facts(proposal_id: str) -> List[Dict[str, Any]]:
-    path = EXTRACTED_DIR / proposal_id / "raw_facts.jsonl"
-    if not path.exists():
-        raise FileNotFoundError(f"raw_facts.jsonl 不存在，请先运行 extract_facts_by_chunk.py: {path}")
+    verified_path = EXTRACTED_DIR / proposal_id / "verified_facts.jsonl"
+    raw_path = EXTRACTED_DIR / proposal_id / "raw_facts.jsonl"
+
+    if verified_path.exists():
+        path = verified_path
+        print(f"[INFO] Using verified facts: {path}")
+    elif raw_path.exists():
+        path = raw_path
+        print(f"[INFO] Verified facts not found, using raw facts: {path}")
+    else:
+        raise FileNotFoundError(
+            f"Neither verified_facts.jsonl nor raw_facts.jsonl found in {EXTRACTED_DIR / proposal_id}"
+        )
 
     facts: List[Dict[str, Any]] = []
     with path.open("r", encoding="utf-8") as f:
