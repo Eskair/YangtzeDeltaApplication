@@ -41,6 +41,7 @@ FRONTEND   = BASE_DIR / "frontend"
 PIPELINE_STEPS = [
     ("prepare_proposal_text",   "Extracting text from document"),
     ("extract_facts_by_chunk",  "Extracting key facts"),
+    ("verify_facts",            "Verifying facts against source"),
     ("build_dimensions_from_facts", "Building analysis dimensions"),
     ("generate_questions",      "Generating evaluation questions"),
     ("llm_answering",           "Running LLM analysis"),
@@ -49,9 +50,9 @@ PIPELINE_STEPS = [
     ("generate_final_report",   "Compiling final report"),
 ]
 
-# ─── in-memory job store ───────────────────────────────────────────────────────
-# job_id → {"status": str, "pid": str, "steps": [...], "error": str|None}
-jobs: dict[str, dict] = {}
+# ─── persistent job store (SQLite-backed, survives restarts) ──────────────────
+from src.api.job_store import JobStore
+jobs = JobStore()
 
 # ─── app ──────────────────────────────────────────────────────────────────────
 app = FastAPI(title="YangtzeDelta Proposal Analyser")
@@ -175,6 +176,7 @@ def _build_step_cmd(script_name: str, pid: str, upload_path: str) -> list[str]:
     args_map = {
         "prepare_proposal_text":   ["--file", upload_path, "--proposal_id", pid],
         "extract_facts_by_chunk":  ["--proposal_id", pid],
+        "verify_facts":            ["--proposal_id", pid],
         "build_dimensions_from_facts": ["--proposal_id", pid],
         "generate_questions":      ["--proposal_id", pid],
         "llm_answering":           ["--proposal_id", pid, "--qs_file", qs_file],
@@ -214,30 +216,42 @@ def _run_step(script_name: str, pid: str, upload_path: str) -> tuple[bool, str]:
     return ok, tail
 
 
-async def _run_pipeline(job_id: str, pid: str):
-    """Background coroutine that drives the pipeline and updates job state."""
+async def _run_pipeline(job_id: str, pid: str, resume_from: int = 0):
+    """Background coroutine that drives the pipeline and updates job state.
+
+    Args:
+        resume_from: step index to resume from (0 = start fresh).
+            Steps before resume_from that are already "done" are skipped.
+    """
     job = jobs[job_id]
     job["status"] = "running"
     upload_path = job.get("upload_path", "")
     progress_file = DATA_DIR / f"step_progress_{pid}.json"
+    jobs[job_id] = job
 
     for i, (script, label) in enumerate(PIPELINE_STEPS):
+        # checkpoint: skip steps that completed in a previous run
+        if i < resume_from and job["steps"][i].get("status") == "done":
+            print(f"⏭ Skipping already-completed step {i}: {script}", flush=True)
+            continue
+
+        job = jobs[job_id]
         job["current_step"] = i
         job["steps"][i]["status"] = "running"
         job["steps"][i]["started_at"] = _utcnow()
+        jobs[job_id] = job
 
-        # reset sub-step progress for the new step
         try:
             progress_file.write_text('{"done":0,"total":0}', encoding="utf-8")
         except Exception:
             pass
 
-        # run in thread so we don't block the event loop
         loop = asyncio.get_running_loop()
         ok, tail = await loop.run_in_executor(
             None, _run_step, script, pid, upload_path
         )
 
+        job = jobs[job_id]
         job["steps"][i]["finished_at"] = _utcnow()
         if ok:
             job["steps"][i]["status"] = "done"
@@ -246,26 +260,27 @@ async def _run_pipeline(job_id: str, pid: str):
             job["steps"][i]["error"] = tail
             job["status"] = "error"
             job["error"] = f"Step '{label}' failed:\n{tail}"
+            jobs[job_id] = job
             return
+        jobs[job_id] = job
 
+    job = jobs[job_id]
     job["status"] = "done"
     job["current_step"] = len(PIPELINE_STEPS)
 
-    # clean up per-pid progress file
     try:
         progress_file.unlink(missing_ok=True)
     except Exception:
         pass
 
-    # locate the report
     report_path = REPORTS / f"{pid}_final_report.md"
     if report_path.exists():
         job["report_path"] = str(report_path)
     else:
         matches = list(REPORTS.glob(f"{pid}*.md"))
         job["report_path"] = str(matches[0]) if matches else ""
+    jobs[job_id] = job
 
-    # send email if address was provided
     recipient = job.get("email", "")
     if recipient and job.get("report_path"):
         loop = asyncio.get_running_loop()
@@ -321,15 +336,32 @@ async def upload_proposal(
 
 @app.post("/api/run/{job_id}")
 async def run_pipeline(job_id: str):
-    """Start the pipeline for an already-uploaded job."""
+    """Start (or resume) the pipeline for an uploaded job.
+
+    If the job previously failed, it automatically resumes from the last
+    successful step instead of re-running the entire pipeline.
+    """
     if job_id not in jobs:
         raise HTTPException(404, "Job not found")
     job = jobs[job_id]
-    if job["status"] not in ("queued",):
+
+    resume_from = 0
+    if job["status"] == "error":
+        for i, step in enumerate(job["steps"]):
+            if step.get("status") == "done":
+                resume_from = i + 1
+            else:
+                break
+        for step in job["steps"][resume_from:]:
+            step["status"] = "pending"
+            step["error"] = None
+        job["error"] = None
+        jobs[job_id] = job
+    elif job["status"] != "queued":
         raise HTTPException(400, f"Job is already in state: {job['status']}")
 
-    asyncio.create_task(_run_pipeline(job_id, job["pid"]))
-    return {"started": True}
+    asyncio.create_task(_run_pipeline(job_id, job["pid"], resume_from=resume_from))
+    return {"started": True, "resumed_from_step": resume_from}
 
 
 @app.patch("/api/jobs/{job_id}/email")
@@ -358,10 +390,14 @@ async def sse_events(job_id: str):
     if job_id not in jobs:
         raise HTTPException(404, "Job not found")
 
+    pid = jobs[job_id]["pid"]
+
     async def generator():
-        prog_file = DATA_DIR / f"step_progress_{jobs[job_id]['pid']}.json"
+        prog_file = DATA_DIR / f"step_progress_{pid}.json"
         while True:
             job = jobs.get(job_id, {})
+            if not job:
+                break
             job_copy = {**job, "steps": [dict(s) for s in job.get("steps", [])]}
             if prog_file.exists():
                 try:
