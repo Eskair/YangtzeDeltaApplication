@@ -464,7 +464,7 @@ def simple_search(query, max_results=8, dimension="general", hints=None, source=
 
     # 过少则二次尝试：中文强化
     if len(norm_urls) < max_results // 2:
-        q2 = f"{query} 生物医药 AI 药物研发 2019..2025"
+        q2 = f"{query} 技术 AI 研发 项目 2019..2025"
         more = duckduckgo_search_fn(q2, max_results)
         for u in more:
             nu = normalize_url(u)

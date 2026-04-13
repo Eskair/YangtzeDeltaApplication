@@ -312,7 +312,7 @@ def call_openai_chat(model: str,
 # ----------------- Prompt 组装 -----------------
 def build_dim_system_prompt() -> str:
     return (
-        "你是一名长期参与 AI+生物医药项目评审的专家顾问。"
+        "你是一名长期参与项目评审的专家顾问。"
         "系统会给出五个维度（team/objectives/strategy/innovation/feasibility）的："
         "· 维度中文含义；· 分数强弱/一致性/漂移的‘文字信号’；"
         "· metrics 抽取的 strengths/risks 短语；"

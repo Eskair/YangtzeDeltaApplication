@@ -300,7 +300,7 @@ def get_openai_client() -> OpenAI:
 # ========== Prompt 模板（强化防幻觉 + 平台视角） ==========
 
 QUESTION_PROMPT_TEMPLATE = """
-你现在扮演“生物医药项目评审专家 + 问卷设计顾问”的角色，负责为一个 AI 辅助评审系统设计【某一个维度】的问题集。
+你现在扮演“项目评审专家 + 问卷设计顾问”的角色，负责为一个 AI 辅助评审系统设计【某一个维度】的问题集。
 
 【系统背景（简要）】
 - 系统会先从提案中抽取五个维度的摘要：team / objectives / strategy / innovation / feasibility。
@@ -489,7 +489,7 @@ def call_llm_for_dimension_questions(
     messages = [
         {
             "role": "system",
-            "content": "你是一个严谨的生物医药项目评审专家，负责为 AI 系统设计结构化问题。",
+            "content": "你是一个严谨的项目评审专家，负责为 AI 系统设计结构化问题。适用于任何领域的项目提案。",
         },
         {
             "role": "user",

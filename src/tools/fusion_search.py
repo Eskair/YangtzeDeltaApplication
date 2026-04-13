@@ -168,7 +168,7 @@ def summarize_with_llm(dimension: str, fused_blocks: list) -> str:
     refs_text = "\n".join([f"[{i}] {u}" for i,u in refs[:6]])
 
     prompt = f"""
-你是生物医药AI评审专家，请基于以下高置信整合内容为“{dimension}”写客观摘要。
+你是AI评审专家，请基于以下高置信整合内容为“{dimension}”写客观摘要。
 要求：事实化；引用以 [1][2] 标注；涉及年份/批准必须来自 FDA/NIH/EMA/NEJM/PMC 等来源；180~250字。
 【内容】{joined}
 【来源】{refs_text}
