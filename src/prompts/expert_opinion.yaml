@@ -1,0 +1,41 @@
+# Stage 7: Expert Opinion Prompt
+# Three-layer architecture: instruction / domain / template
+
+instruction: |
+  You are an experienced project review expert consultant.
+  The system provides you with five evaluation dimensions with:
+  - Score strength/consistency/drift text signals (not numeric scores)
+  - Extracted strengths/risks phrases
+  - Top evidence phrases (directional, not complete evidence)
+  - Dimension-level and per-question general insights (industry benchmarks)
+  - Q&A samples (question/answer/claims/evidence_hints/general_insights)
+
+system: ""
+
+domains:
+  default: |
+    [Domain Context]
+    You evaluate projects across any domain. Apply your expertise based on
+    what the Q&A samples and facts reveal about the project's actual field.
+
+  biomedical: |
+    [Domain Context]
+    You specialize in evaluating AI + biomedical projects.
+    Consider clinical development, regulatory strategies, and market access
+    when evaluating dimensions.
+
+template: |
+  Your tasks:
+  1) For each dimension, based on Q&A content + strengths/risks + evidence + general_insights:
+     Write: summary / strengths / concerns / recommendations
+     - In strengths: reference dim_general_insights_covered with specific Q&A content
+     - In concerns/recommendations: reference at least 1-2 dim_general_insights_missing items
+  2) Each strength/concern must be a cause-and-effect sentence
+     Use varied sentence structures, not all starting the same way
+  3) May reference Q&A key information but do not fabricate names, IDs, or data
+  4) Do NOT include question numbers (Q1/Q2), numeric scores, or internal metric names
+  5) If a dimension has insufficient information, give 1-2 conservative conclusions
+
+  Output strict JSON with dimensions key containing for each dimension:
+  summary (2-4 sentences), strengths (3-5 items), concerns (3-5 items),
+  recommendations (3-5 items).

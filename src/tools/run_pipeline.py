@@ -38,6 +38,9 @@ def run_full_pipeline():
     # 2) facts 抽取
     run_cmd(["python", "src/tools/extract_facts_by_chunk.py"])
 
+    # 2.5) fact verification
+    run_cmd(["python", "src/tools/verify_facts.py"])
+
     # 3) 由 facts 构建维度
     run_cmd(["python", "src/tools/build_dimensions_from_facts.py"])
 

@@ -1,0 +1,74 @@
+# Stage 3: Question Generation Prompt
+# Three-layer architecture: instruction / domain / template
+
+instruction: |
+  You are a project evaluation expert and questionnaire design consultant.
+  Your task is to design a set of evaluation questions for one specific dimension
+  of an AI-assisted review system.
+
+system: |
+  You are a rigorous project evaluation expert responsible for designing
+  structured questions for an AI review system.
+
+domains:
+  default: |
+    [System Background]
+    - The system extracts dimension-based summaries from project proposals.
+    - You are responsible for one dimension at a time.
+    - Questions must be grounded in the provided dimension payload.
+
+  biomedical: |
+    [System Background]
+    - The system reviews biomedical & AI project proposals.
+    - You are responsible for one dimension at a time.
+    - Questions must be grounded in the provided dimension payload.
+    - Consider clinical trial design, regulatory pathways, and market access when relevant.
+
+template: |
+  [Current Dimension]
+  - Dimension key: {{ dimension_name }}
+  - Focus area: {{ dimension_focus }}
+
+  [Aspect configuration]
+  {{ aspects_json }}
+
+  [Content binding requirements]
+  1. At least half of questions must point to one or more key_points
+  2. If risks exist in the payload, at least 2 questions should address those risks
+  3. If mitigations exist, at least 1 question should evaluate their adequacy
+  4. Do NOT invent entity names not present in the payload
+
+  [Information gap handling]
+  - Questions must allow for "insufficient proposal information" scenarios
+  - Include phrasing like: "If the proposal does not provide details on X,
+    please first note this gap and then discuss its impact on assessment."
+
+  [Question design principles]
+  1. Targeted: tied to current dimension and aspects
+  2. Answerable: based on general knowledge + dimension payload
+  3. Structured: answer_type from ["analysis", "rating", "yes_no", "open"]
+  4. Bilingual: provide question_zh (Chinese) and question_en (English)
+
+  [Quantity: {{ min_q }} to {{ max_q }} questions]
+  - At least 3 priority=1 questions
+  - At least 2 rating questions and 3 analysis questions
+
+  [Output JSON structure]
+  {
+    "questions": [
+      {
+        "aspect": "aspect_id",
+        "question_zh": "Chinese question",
+        "question_en": "English question",
+        "answer_type": "analysis|rating|yes_no|open",
+        "priority": 1|2|3,
+        "links_to": {
+          "key_points": [0, 2],
+          "risks": [],
+          "mitigations": []
+        }
+      }
+    ]
+  }
+
+  Output only JSON, no extra text.

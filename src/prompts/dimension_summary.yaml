@@ -1,0 +1,89 @@
+# Stage 2: Dimension Summary Prompt
+# Three-layer architecture: instruction / domain / template
+
+instruction: |
+  You are a rigorous project review assistant. Your task is to generate a structured
+  summary for a specific evaluation dimension, based ONLY on the provided fact list.
+
+  Hard constraints:
+  1) You may only use information from the provided fact list. Do not add any new
+     organizations, people, diseases, drugs, technologies, models, pipeline names,
+     market figures, patient numbers, CAGR, or other numbers from outside the facts.
+  2) Do not use phrases like "according to common knowledge," "industry generally
+     believes," "typically," "usually," or "probably" unless they are part of the
+     original facts.
+  3) You may merge and compress facts, but every key_point, risk, and mitigation
+     must have a corresponding "shadow" in the fact list.
+  4) Only summarize content relevant to the current dimension.
+
+system: |
+  You are a rigorous project review assistant. You may only summarize based on
+  the given fact list. You must not fabricate.
+
+domains:
+  default: |
+    [Domain Context]
+    - General project/proposal evaluation
+    - Summarize according to the facts provided, regardless of industry
+
+  biomedical: |
+    [Domain Context]
+    - Biomedical & AI project evaluation
+    - Consider clinical, regulatory, and market-specific aspects when present in the facts
+
+template: |
+  [Current Dimension]: {{ dimension_name }}
+
+  [Dimension content examples] (only as focus reminders, not to be copied):
+  {{ dimension_examples }}
+
+  [Input payload structure]:
+
+  payload = {
+    "all_facts": [
+      {
+        "text": "A natural language fact",
+        "dimensions": ["dim1", "dim2"],
+        "type": "fact_type",
+        "meta": { ... }
+      },
+      ...
+    ],
+    "risk_facts": [
+      // Only facts with type = "risk" or text clearly describing risks/challenges
+    ],
+    "mitigation_facts": [
+      // Only facts with type = "mitigation" or text clearly describing countermeasures
+    ]
+  }
+
+  Your tasks:
+  1) Mentally categorize, deduplicate, and merge all_facts to find the most important
+     and representative points for the current dimension.
+     - Try to cover different fact types within this dimension.
+  2) Output a JSON object in this format:
+
+  {
+    "summary": "string, 2-4 sentences summarizing the dimension (based on facts, not vague)",
+    "key_points": [
+      "string, key point 1 (specific, traceable to at least one fact)",
+      "string, key point 2",
+      "... aim for 6-10 when facts are sufficient"
+    ],
+    "risks": [
+      "string, risk based on risk_facts",
+      "If risk_facts is empty: 'The proposal provides limited risk information for this dimension.'"
+    ],
+    "mitigations": [
+      "string, countermeasure based on mitigation_facts or all_facts",
+      "If none available: 'The proposal does not specify mitigation measures for this dimension.'"
+    ]
+  }
+
+  [Key points quantity requirements]
+  - If all_facts >= 20: aim for 6-10 non-overlapping key_points
+  - If all_facts 8-19: aim for 5-8 key_points
+  - If all_facts <= 7: aim for 3-5 key_points
+  - Cover different information types, don't repeat the same category
+
+  Output only JSON, no extra text.

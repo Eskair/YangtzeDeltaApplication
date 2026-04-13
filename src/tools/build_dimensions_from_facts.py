@@ -166,12 +166,28 @@ payload = {
 
 
 def load_raw_facts(proposal_id: str) -> List[Dict[str, Any]]:
-    path = EXTRACTED_DIR / proposal_id / "raw_facts.jsonl"
-    if not path.exists():
-        raise FileNotFoundError(f"raw_facts.jsonl 不存在，请先运行 extract_facts_by_chunk.py: {path}")
+    """
+    Load facts, preferring verified_facts.jsonl (Stage 1.5 output) over raw_facts.jsonl.
+    When verified facts are available, unverified facts are down-ranked by placing
+    them after verified and partially_verified ones, giving downstream LLM calls
+    higher-quality input within token limits.
+    """
+    verified_path = EXTRACTED_DIR / proposal_id / "verified_facts.jsonl"
+    raw_path = EXTRACTED_DIR / proposal_id / "raw_facts.jsonl"
+
+    if verified_path.exists():
+        source_path = verified_path
+        print(f"[INFO] Using verified facts from: {verified_path}")
+    elif raw_path.exists():
+        source_path = raw_path
+        print(f"[INFO] Using raw facts from: {raw_path}")
+    else:
+        raise FileNotFoundError(
+            f"Neither verified_facts.jsonl nor raw_facts.jsonl found for proposal: {proposal_id}"
+        )
 
     facts: List[Dict[str, Any]] = []
-    with path.open("r", encoding="utf-8") as f:
+    with source_path.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -182,7 +198,24 @@ def load_raw_facts(proposal_id: str) -> List[Dict[str, Any]]:
                 continue
             if isinstance(obj, dict):
                 facts.append(obj)
-    print(f"[INFO] 读取 facts 数量: {len(facts)} 来自 {path}")
+
+    # Sort by verification score (highest first) when verification data is present
+    has_verification = any(f.get("verification") for f in facts)
+    if has_verification:
+        status_rank = {"verified": 0, "partially_verified": 1, "unverified": 2}
+        facts.sort(
+            key=lambda f: (
+                status_rank.get(f.get("verification", {}).get("status", "unverified"), 2),
+                -(f.get("verification", {}).get("score", 0.0)),
+            )
+        )
+        verified_count = sum(
+            1 for f in facts
+            if f.get("verification", {}).get("status") == "verified"
+        )
+        print(f"[INFO] Facts sorted by verification status: {verified_count} verified out of {len(facts)}")
+
+    print(f"[INFO] Loaded {len(facts)} facts from {source_path}")
     return facts
 
 

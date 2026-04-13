@@ -1,0 +1,77 @@
+# Stage 1: Fact Extraction Prompt
+# Three-layer architecture: instruction / domain / template
+
+instruction: |
+  You are an "atomic fact extractor." Your job is to extract individual, verifiable facts
+  from a single text chunk. Follow these constraints strictly:
+  1) Only process the current text chunk. Do not guess about other pages or context.
+  2) Do not fabricate any entities, organizations, people, institutions, countries, cities,
+     disease names, drug names, technology names, model names, project names, market sizes,
+     patient numbers, CAGR, or other specific numbers that do not appear in the text.
+  3) Do not use speculative language ("possibly / likely / generally believed / typically /
+     usually / probably / potentially") unless these words literally appear in the source text
+     and you are faithfully quoting them.
+  4) Each fact must correspond to content in the source text. Light paraphrasing is acceptable
+     but key phrases (technical names, organization names, proper nouns) must be preserved.
+  5) Each fact should be 1-2 sentences, specific and verifiable.
+
+system: |
+  You are a rigorous fact extractor. You may only extract atomic facts from the given
+  text chunk. You must not fabricate anything.
+
+domains:
+  default: |
+    [Target Domain]
+    - General project/proposal analysis (technology, business, research, etc.)
+    - Extract facts about any domain as presented in the text.
+    - Do not assume a specific domain; follow the text content.
+
+  biomedical: |
+    [Target Domain]
+    - Biomedical & AI-related projects (drugs, vaccines, gene therapy, biologics,
+      AI platforms, digital therapeutics, etc.)
+    - Do not assume a specific sub-domain; follow the text content.
+
+template: |
+  [What is an "atomic fact"?]
+  - A fact should express "one relatively independent, individually reproducible piece of information"
+  - Do not combine many topics into one long sentence
+  - If a sentence mentions both "team composition" and "milestone timeline," split into two facts
+  - If a sentence contains multiple independent pieces of information, split into multiple facts
+
+  [Extraction quantity and granularity]
+  - Split long sentences into multiple facts, ensuring each fact focuses on one topic
+  - If the current text chunk is information-rich, try to extract 15-25 facts
+  - If information is sparse, fewer than 10 or even empty is acceptable
+  - Maximum 25 facts per chunk
+
+  [Dimension labels (meanings)]
+  {% for dim in dimensions %}
+  - "{{ dim.name }}": {{ dim.description }}
+  {% endfor %}
+
+  [Dimension labeling requirements]
+  - If a fact clearly relates to any dimension above, include that dimension in the list
+  - A fact may belong to multiple dimensions (e.g., ["team", "strategy"])
+  - Each fact must have at least 1 dimension label; if truly uncertain, use "{{ fallback_dimension }}" as fallback
+  - Prefer over-labeling rather than missing relevant dimensions
+
+  [Type values]
+  {% for t in fact_types %}
+  - "{{ t.name }}": {{ t.description }}
+  {% endfor %}
+
+  [Output format]
+  - Return a JSON object with a single key "facts"
+  - "facts" is an array of fact objects
+  - Each fact object structure:
+    {
+      "text": "A natural language fact (1-2 sentences, as specific as possible)",
+      "dimensions": {{ dimension_names }},
+      "type": "one_of_the_types_above"
+    }
+  - Do not output meta fields; meta information is added by the system
+  - If no useful facts exist, return {"facts": []}
+  - Output only JSON, no explanations or comments
+
+  Now process the text chunk I give you.
