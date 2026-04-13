@@ -200,6 +200,8 @@ def _run_step(script_name: str, pid: str, upload_path: str) -> tuple[bool, str]:
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         bufsize=1,
     )
     lines: list[str] = []
