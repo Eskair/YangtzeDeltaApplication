@@ -39,14 +39,15 @@ REPORTS    = DATA_DIR / "reports"
 FRONTEND   = BASE_DIR / "frontend"
 
 PIPELINE_STEPS = [
-    ("prepare_proposal_text",   "Extracting text from document"),
-    ("extract_facts_by_chunk",  "Extracting key facts"),
+    ("prepare_proposal_text",       "Extracting text from document"),
+    ("extract_facts_by_chunk",      "Extracting key facts"),
+    ("verify_facts",                "Verifying extracted facts"),
     ("build_dimensions_from_facts", "Building analysis dimensions"),
-    ("generate_questions",      "Generating evaluation questions"),
-    ("llm_answering",           "Running LLM analysis"),
-    ("post_processing",         "Post-processing answers"),
-    ("ai_expert_opinion",       "Generating expert opinion"),
-    ("generate_final_report",   "Compiling final report"),
+    ("generate_questions",          "Generating evaluation questions"),
+    ("llm_answering",               "Running LLM analysis"),
+    ("post_processing",             "Post-processing answers"),
+    ("ai_expert_opinion",           "Generating expert opinion"),
+    ("generate_final_report",       "Compiling final report"),
 ]
 
 # ─── in-memory job store ───────────────────────────────────────────────────────
@@ -173,14 +174,15 @@ def _build_step_cmd(script_name: str, pid: str, upload_path: str) -> list[str]:
     """Build the full command for a pipeline script with explicit pid args."""
     qs_file = str(DATA_DIR / "questions" / pid / "generated_questions.json")
     args_map = {
-        "prepare_proposal_text":   ["--file", upload_path, "--proposal_id", pid],
-        "extract_facts_by_chunk":  ["--proposal_id", pid],
+        "prepare_proposal_text":       ["--file", upload_path, "--proposal_id", pid],
+        "extract_facts_by_chunk":      ["--proposal_id", pid],
+        "verify_facts":                ["--proposal_id", pid],
         "build_dimensions_from_facts": ["--proposal_id", pid],
-        "generate_questions":      ["--proposal_id", pid],
-        "llm_answering":           ["--proposal_id", pid, "--qs_file", qs_file],
-        "post_processing":         ["--pid", pid],
-        "ai_expert_opinion":       ["--pid", pid],
-        "generate_final_report":   ["--pid", pid],
+        "generate_questions":          ["--proposal_id", pid],
+        "llm_answering":               ["--proposal_id", pid, "--qs_file", qs_file],
+        "post_processing":             ["--pid", pid],
+        "ai_expert_opinion":           ["--pid", pid],
+        "generate_final_report":       ["--pid", pid],
     }
     extra = args_map.get(script_name, [])
     return [python_bin(), f"src/tools/{script_name}.py"] + extra

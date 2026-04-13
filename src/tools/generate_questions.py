@@ -66,15 +66,31 @@ def _write_progress(done: int, total: int, pid: str = "") -> None:
 QUESTIONS_DIR = DATA_DIR / "questions"
 CONFIG_QS_DIR = DATA_DIR / "config" / "question_sets"
 
-QUESTIONS_DIR.mkdir(parents=True, exist_ok=True)
-CONFIG_QS_DIR.mkdir(parents=True, exist_ok=True)
-
 # ========== LLM 配置 ==========
 
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 PROVIDER = os.getenv("PROVIDER", "openai").lower()
 
-DIMENSION_NAMES = ["team", "objectives", "strategy", "innovation", "feasibility"]
+
+def _get_domain_config():
+    """Load config from centralized config system."""
+    try:
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+        from src.config import get_config
+        return get_config()
+    except Exception:
+        return None
+
+
+def _get_dimension_names():
+    cfg = _get_domain_config()
+    if cfg:
+        return cfg.dimension_names
+    return ["team", "objectives", "strategy", "innovation", "feasibility"]
+
+
+DIMENSION_NAMES = _get_dimension_names()
 
 # 一些“平台/中长期视角”的 aspect id，用于简单 sanity check
 PLATFORM_ASPECT_IDS = {
@@ -125,185 +141,85 @@ def _looks_like_market_question(q_zh: str, q_en: str) -> bool:
 
 # ========== 维度专属配置 ==========
 
-DIMENSION_CONFIG: Dict[str, Dict[str, Any]] = {
-    "team": {
-        "min_q": 6,
-        "max_q": 9,
-        "focus_zh": (
-            "关注团队组成、核心 PI/负责人履历、临床与法规经验、跨机构合作网络、"
-            "以及团队对长期项目执行的稳定性和时间投入。"
-        ),
-        "aspects": [
-            {
-                "id": "leadership_experience",
-                "desc_zh": "项目负责人 / 核心 PI 的领导经验与往期重大项目执行记录",
-            },
-            {
-                "id": "domain_expertise",
-                "desc_zh": "团队在目标疾病领域、生物制药和 AI 技术方面的专业深度",
-            },
-            {
-                "id": "clinical_regulatory_experience",
-                "desc_zh": "团队在临床试验设计、GCP 实践、药品/器械注册和法规合规方面的经验",
-            },
-            {
-                "id": "collaboration_network",
-                "desc_zh": "国内外合作机构、医院、产业伙伴网络及其稳定性/互补性",
-            },
-            {
-                "id": "governance_and_decision_making",
-                "desc_zh": "项目治理结构、决策机制、利益冲突管理和质量控制体系",
-            },
-            {
-                "id": "team_capacity_and_bandwidth",
-                "desc_zh": "团队当前人力负荷、项目并行数量，是否有足够时间和资源投入本项目",
-            },
-        ],
-    },
-    "objectives": {
-        "min_q": 6,
-        "max_q": 9,
-        "focus_zh": (
-            "关注项目总体目标的清晰度、分阶段里程碑、与疾病未满足需求的匹配度、"
-            "以及可量化的效果指标和可实现性。"
-        ),
-        "aspects": [
-            {
-                "id": "overall_goal_clarity",
-                "desc_zh": "总体目标是否明确、聚焦，是否避免过度发散（过多不相关子目标）",
-            },
-            {
-                "id": "unmet_need_alignment",
-                "desc_zh": "项目针对的疾病负担 / 未满足临床需求的匹配程度与紧迫性",
-            },
-            {
-                "id": "milestones_and_timeline",
-                "desc_zh": "各阶段里程碑（0-12 个月、12-36 个月等）的设计是否合理可执行",
-            },
-            {
-                "id": "outcome_and_success_metrics",
-                "desc_zh": "目标是否有清晰可量化的成功指标（临床终点、技术指标、商业 KPI 等）",
-            },
-            {
-                "id": "scope_and_prioritization",
-                "desc_zh": "项目范围是否过大 / 过多管线并行，是否做了优先级排序与取舍",
-            },
-            {
-                "id": "realism_and_ambition_balance",
-                "desc_zh": "目标在雄心和可行性之间的平衡程度（是否过于理想化或过于保守）",
-            },
-        ],
-    },
-    "strategy": {
-        "min_q": 7,
-        "max_q": 10,
-        "focus_zh": (
-            "关注技术路线设计、临床开发路径、法规策略、市场与商业化路径、"
-            "合作伙伴策略和数据资源利用方式。"
-        ),
-        "aspects": [
-            {
-                "id": "technical_strategy",
-                "desc_zh": "技术路线（包括 AI 模型、递送系统、实验验证路径）的合理性与替代方案",
-            },
-            {
-                "id": "clinical_development_path",
-                "desc_zh": "临床开发分期（I/II/III 期或真实世界验证等）的规划与关键假设",
-            },
-            {
-                "id": "regulatory_strategy",
-                "desc_zh": "针对目标适应症和产品形态的注册 / 监管策略（加速通道、组合申报等）",
-            },
-            {
-                "id": "commercialization_and_market_entry",
-                "desc_zh": "商业化模式、定价与报销策略、市场进入路径（国家/地区/场景选择）",
-            },
-            {
-                "id": "partnership_and_business_model",
-                "desc_zh": "与制药公司、医院、平台公司等的合作模式（授权、共同开发、服务等）",
-            },
-            {
-                "id": "data_and_real_world_evidence_strategy",
-                "desc_zh": "对真实世界数据、队列、登记系统的利用策略，以及隐私与合规安排",
-            },
-            {
-                "id": "scaling_and_globalization",
-                "desc_zh": "项目从早期验证到大规模推广（多中心、跨国）的扩展策略",
-            },
-        ],
-    },
-    "innovation": {
-        "min_q": 6,
-        "max_q": 9,
-        "focus_zh": (
-            "关注技术/产品相对现有方案的创新性、差异化优势、知识产权布局和现有证据支撑。"
-        ),
-        "aspects": [
-            {
-                "id": "novelty_vs_state_of_art",
-                "desc_zh": "相对当前国际前沿方案（药物、递送系统、AI 方法等）的真正创新点",
-            },
-            {
-                "id": "differentiation_and_competitive_edge",
-                "desc_zh": "与现有同类或替代方案相比的明确优势（疗效、安全性、成本等）",
-            },
-            {
-                "id": "ip_and_protection",
-                "desc_zh": "专利/软件著作/数据资产的保护布局，是否足以支撑中长期竞争",
-            },
-            {
-                "id": "evidence_strength_for_innovation",
-                "desc_zh": "对创新点的实验/临床/真实世界证据强度（样本量、设计质量、可重复性）",
-            },
-            {
-                "id": "platform_and_extensibility",
-                "desc_zh": "是否构成可拓展的平台（可迁移到其他适应症/产品线），或只是单点创新",
-            },
-            {
-                "id": "risk_of_obsolescence",
-                "desc_zh": "技术在 3-5 年内被替代或快速过时的风险评估",
-            },
-        ],
-    },
-    "feasibility": {
-        "min_q": 7,
-        "max_q": 10,
-        "focus_zh": (
-            "关注资源与基础设施、资金与预算、实施路径、关键风险和应对措施、"
-            "以及落地可行性（包括法规和支付环境）。"
-        ),
-        "aspects": [
-            {
-                "id": "resources_and_infrastructure",
-                "desc_zh": "实验平台、临床基地、数据平台等资源是否充足且可长期稳定使用",
-            },
-            {
-                "id": "funding_and_budget_planning",
-                "desc_zh": "资金来源多样性、预算分配的合理性，以及后续融资/可持续性计划",
-            },
-            {
-                "id": "operational_execution_plan",
-                "desc_zh": "项目实施路径（关键任务、时间表、责任人）是否具体清晰",
-            },
-            {
-                "id": "risk_management",
-                "desc_zh": "对技术、临床、市场、合规等风险的识别与量化，以及对应缓解措施",
-            },
-            {
-                "id": "regulatory_and_reimbursement_feasibility",
-                "desc_zh": "在目标市场实现审批通过和纳入报销/支付体系的现实可行性",
-            },
-            {
-                "id": "implementation_barriers",
-                "desc_zh": "在真实医疗场景中落地的阻力（医生采纳、患者依从性、系统集成等）",
-            },
-            {
-                "id": "timeline_and_resource_alignment",
-                "desc_zh": "时间表与资源投入是否匹配，是否存在明显的瓶颈期或人手不足期",
-            },
-        ],
-    },
-}
+
+def _build_dimension_config() -> Dict[str, Dict[str, Any]]:
+    """
+    Build DIMENSION_CONFIG from the centralized config system.
+    Falls back to hardcoded defaults if the config system is unavailable.
+    """
+    cfg = _get_domain_config()
+    if cfg:
+        result = {}
+        for dim_name in cfg.dimension_names:
+            d = cfg.get_dimension_config_dict(dim_name)
+            if d:
+                result[dim_name] = d
+        if result:
+            return result
+
+    # Hardcoded fallback (preserves original behavior)
+    return {
+        "team": {
+            "min_q": 6, "max_q": 9,
+            "focus_zh": "关注团队组成、核心负责人履历、跨机构合作网络、以及团队稳定性和时间投入。",
+            "aspects": [
+                {"id": "leadership_experience", "desc_zh": "项目负责人的领导经验与往期重大项目执行记录"},
+                {"id": "domain_expertise", "desc_zh": "团队在目标领域的专业深度"},
+                {"id": "collaboration_network", "desc_zh": "合作机构、产业伙伴网络及互补性"},
+                {"id": "governance_and_decision_making", "desc_zh": "项目治理结构、决策机制、质量控制"},
+                {"id": "team_capacity_and_bandwidth", "desc_zh": "团队当前人力负荷与资源投入能力"},
+            ],
+        },
+        "objectives": {
+            "min_q": 6, "max_q": 9,
+            "focus_zh": "关注项目总体目标的清晰度、分阶段里程碑、可量化指标和可实现性。",
+            "aspects": [
+                {"id": "overall_goal_clarity", "desc_zh": "总体目标是否明确、聚焦"},
+                {"id": "milestones_and_timeline", "desc_zh": "各阶段里程碑的设计是否合理可执行"},
+                {"id": "outcome_and_success_metrics", "desc_zh": "是否有清晰可量化的成功指标"},
+                {"id": "scope_and_prioritization", "desc_zh": "项目范围和优先级排序"},
+                {"id": "realism_and_ambition_balance", "desc_zh": "目标在雄心和可行性之间的平衡"},
+            ],
+        },
+        "strategy": {
+            "min_q": 7, "max_q": 10,
+            "focus_zh": "关注技术路线设计、市场与商业化路径、合作伙伴策略和资源利用方式。",
+            "aspects": [
+                {"id": "technical_strategy", "desc_zh": "技术路线的合理性与替代方案"},
+                {"id": "commercialization_and_market_entry", "desc_zh": "商业化模式、定价与市场进入路径"},
+                {"id": "partnership_and_business_model", "desc_zh": "合作模式（授权、共同开发、服务等）"},
+                {"id": "data_and_evidence_strategy", "desc_zh": "数据利用策略及隐私合规安排"},
+                {"id": "scaling_and_globalization", "desc_zh": "从验证到大规模推广的扩展策略"},
+            ],
+        },
+        "innovation": {
+            "min_q": 6, "max_q": 9,
+            "focus_zh": "关注技术/产品相对现有方案的创新性、差异化优势、知识产权布局和证据支撑。",
+            "aspects": [
+                {"id": "novelty_vs_state_of_art", "desc_zh": "相对当前前沿方案的真正创新点"},
+                {"id": "differentiation_and_competitive_edge", "desc_zh": "与替代方案相比的明确优势"},
+                {"id": "ip_and_protection", "desc_zh": "专利/数据资产的保护布局"},
+                {"id": "evidence_strength_for_innovation", "desc_zh": "创新点的实验/验证证据强度"},
+                {"id": "platform_and_extensibility", "desc_zh": "是否构成可拓展的平台或仅单点创新"},
+                {"id": "risk_of_obsolescence", "desc_zh": "技术在3-5年内被替代的风险评估"},
+            ],
+        },
+        "feasibility": {
+            "min_q": 7, "max_q": 10,
+            "focus_zh": "关注资源与基础设施、资金与预算、实施路径、关键风险和应对措施、落地可行性。",
+            "aspects": [
+                {"id": "resources_and_infrastructure", "desc_zh": "资源平台是否充足且可长期稳定使用"},
+                {"id": "funding_and_budget_planning", "desc_zh": "资金来源多样性、预算分配合理性"},
+                {"id": "operational_execution_plan", "desc_zh": "实施路径是否具体清晰"},
+                {"id": "risk_management", "desc_zh": "对各类风险的识别与缓解措施"},
+                {"id": "implementation_barriers", "desc_zh": "在实际场景中落地的阻力"},
+                {"id": "timeline_and_resource_alignment", "desc_zh": "时间表与资源投入是否匹配"},
+            ],
+        },
+    }
+
+
+DIMENSION_CONFIG: Dict[str, Dict[str, Any]] = _build_dimension_config()
 
 
 # ========== 工具函数 ==========

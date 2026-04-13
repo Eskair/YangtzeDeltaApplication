@@ -39,14 +39,39 @@ def _write_progress(done: int, total: int, pid: str = "") -> None:
     except Exception:
         pass
 
-DIM_ORDER = ["team", "objectives", "strategy", "innovation", "feasibility"]
-DIM_LABELS_ZH = {
-    "team": "团队与治理",
-    "objectives": "项目目标",
-    "strategy": "实施路径与战略",
-    "innovation": "技术与产品创新",
-    "feasibility": "资源与可行性"
-}
+def _get_domain_config():
+    """Load config from centralized config system."""
+    try:
+        import sys
+        sys.path.insert(0, str(BASE_DIR))
+        from src.config import get_config
+        return get_config()
+    except Exception:
+        return None
+
+
+def _init_dim_order():
+    cfg = _get_domain_config()
+    if cfg:
+        return cfg.dimension_names
+    return ["team", "objectives", "strategy", "innovation", "feasibility"]
+
+
+def _init_dim_labels():
+    cfg = _get_domain_config()
+    if cfg:
+        return cfg.dimension_labels_zh
+    return {
+        "team": "团队与治理",
+        "objectives": "项目目标",
+        "strategy": "实施路径与战略",
+        "innovation": "技术与产品创新",
+        "feasibility": "资源与可行性",
+    }
+
+
+DIM_ORDER = _init_dim_order()
+DIM_LABELS_ZH = _init_dim_labels()
 
 # ----------------- 环境变量 -----------------
 load_dotenv()
