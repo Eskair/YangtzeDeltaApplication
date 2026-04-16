@@ -114,8 +114,8 @@ DIMENSION_PROMPT_TEMPLATE = """
 - feasibility:
   - 资源基础（实验室、平台、合作方）
   - 预算和资金规划、资金来源
-  - 风险矩阵及应对措施（技术、市场、资金、法规、AI 模型等）
-  - 时间表、实施路径、入组/依从性等可行性因素
+  - 风险矩阵及应对措施（技术、市场、资金、法规等）
+  - 时间表、实施路径、资源约束等可行性因素
 
 【输入给你的 JSON 结构】（payload）：
 
@@ -434,7 +434,7 @@ def call_llm_for_dimension(dimension_name: str, facts: List[Dict[str, Any]]) -> 
     messages = [
         {
             "role": "system",
-            "content": "你是一个严谨的项目评审助手，只能基于给定的事实列表进行总结，不得编造。",
+            "content": "你是一个严谨的项目评审助手，只能基于给定的事实列表进行总结，不得编造。适用于任何领域的项目提案。",
         },
         {
             "role": "user",

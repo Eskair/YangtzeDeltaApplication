@@ -208,7 +208,7 @@ def llm_generate_queries(question, context, dimension, hints=None, entities=None
     mh_text = "; ".join(must_have) if must_have else "LNP/inhaled/aerosol/pulmonary"
 
     prompt = f"""
-你是AI生物医药检索专家。针对“问题+维度+摘要+hint+实体+数字”，生成 {FIRST_ROUND_N} 条高质量检索query。
+你是AI检索专家。针对“问题+维度+摘要+hint+实体+数字”，生成 {FIRST_ROUND_N} 条高质量检索query。
 要求：
 - 每条尽量包含：实体/机构/模型名/登记号/关键数字（若有）
 - 使用 site: 与时间窗（{time_hint}），中英均可，简洁可直投 Google
@@ -229,7 +229,7 @@ hints：{hint_text}；{dim_hints}
         content = rsp.choices[0].message.content.strip()
         queries = safe_json_loads(content)
         queries = [clean_query(q["query"] if isinstance(q, dict) and "query" in q else str(q)) for q in queries]
-        zh_variants = [f"{q} 生物医药 药物研发 AI 临床 监管 {time_hint}" for q in queries]
+        zh_variants = [f"{q} 技术 研发 AI 行业 策略 {time_hint}" for q in queries]
         merged = uniq(queries + zh_variants)
         return merged[:MAX_QUERIES_PER_DIM] if merged else [question]
     except Exception as e:
