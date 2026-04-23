@@ -532,17 +532,28 @@ def build_overall_from_dims(dim_blocks: Dict[str, Any],
 
     优化点：
     - verdict 阈值略放宽，让中间地带更多落在 HOLD，而不是一刀切 NO-GO；
+    - 若 metrics 含 overall_score_raw / 各维度 avg_raw，则 verdict 仅基于该原始尺度，展示分仍用校准后的 overall_score；
     - 总体 summary 采用“一段总括 + 分维度 bullet”的结构；
     - 配合后续 markdown 渲染，读起来更像人写的评审意见。
     """
+    # 展示用：与 post_processing 写入 metrics 的校准后分一致
     overall_score = float(metrics_overall.get("overall_score", 0.0) or 0.0)
     overall_conf = float(metrics_overall.get("overall_confidence", 0.0) or 0.0)
+    # 决策用：若存在 raw，则 verdict 仅基于原始尺度，避免「输出校准」抬分导致误判 GO
+    overall_score_v = float(metrics_overall.get("overall_score_raw", overall_score) or 0.0)
+    overall_conf_v = float(metrics_overall.get("overall_confidence_raw", overall_conf) or 0.0)
+
+    def _dim_avg_for_verdict(dims: Dict[str, Any], dim: str) -> float:
+        blk = dims.get(dim, {}) or {}
+        if "avg_raw" in blk:
+            return float(blk.get("avg_raw", 0.0) or 0.0)
+        return float(blk.get("avg", 0.0) or 0.0)
 
     # 1) 判定 verdict
     def verdict_rule(score: float, conf: float,
                      dims: Dict[str, Any]) -> (str, str):
-        inv = float(dims.get("innovation", {}).get("avg", 1.0) or 1.0)
-        fea = float(dims.get("feasibility", {}).get("avg", 1.0) or 1.0)
+        inv = _dim_avg_for_verdict(dims, "innovation")
+        fea = _dim_avg_for_verdict(dims, "feasibility")
 
         # ① 明确 GO：得分 + 信心都比较稳
         if score >= 0.62 and conf >= 0.65:
@@ -563,7 +574,7 @@ def build_overall_from_dims(dim_blocks: Dict[str, Any],
             "建议在补充必要材料和澄清关键风险后，再做更明确的 go/no-go 决策。"
         )
 
-    verdict, verdict_reason = verdict_rule(overall_score, overall_conf, metrics_dims)
+    verdict, verdict_reason = verdict_rule(overall_score_v, overall_conf_v, metrics_dims)
 
     # 2) 总体 summary：一段总括 + 分维度 bullet
     # 2.1 总括句随 verdict 变化
@@ -626,22 +637,54 @@ def build_overall_from_dims(dim_blocks: Dict[str, Any],
             recs.append(f"【{label}】{r}")
     recs = dedup_soft(clean_list(recs))[:8]
 
+    basis_lines = [
+        f"结论依据：{verdict_reason}",
+        "结论完全基于已选中问答结果与自动评分信号，未引入外部资料。",
+    ]
+    if (
+        abs(overall_score - overall_score_v) > 0.02
+        or abs(overall_conf - overall_conf_v) > 0.02
+    ):
+        basis_lines.append(
+            f"verdict 判定使用原始尺度信号（综合分 {overall_score_v:.3f}，信心度 {overall_conf_v:.3f}）；"
+            f"本页展示的综合分与信心度为输出校准后读数（{overall_score:.3f}，{overall_conf:.3f}）。"
+        )
+
     return {
         "summary": summary_text,
         "overall_score_echo": overall_score,
         "confidence_echo": overall_conf,
+        "overall_score_raw_echo": overall_score_v,
+        "confidence_raw_echo": overall_conf_v,
         "key_strengths": key_strengths,
         "key_risks": key_risks,
         "recommendations": recs,
         "verdict": verdict,
-        "basis": [
-            f"结论依据：{verdict_reason}",
-            "结论完全基于已选中问答结果与自动评分信号，未引入外部资料。"
-        ]
+        "basis": basis_lines,
     }
 
 
 # ----------------- Markdown 渲染 -----------------
+def _build_scoring_explainer(metrics: Dict[str, Any]) -> Dict[str, Any]:
+    """从 metrics.config_used 抽取报告中回显的计分要点。"""
+    cu = metrics.get("config_used") or {}
+    out: Dict[str, Any] = {
+        "consistency_weight": float(cu.get("consistency_weight", 0.20) or 0.20),
+        "dimension_weight": {
+            k: float(v) for k, v in (cu.get("dimension_weight") or {}).items()
+        },
+    }
+    oc = cu.get("output_calibration")
+    if isinstance(oc, dict) and oc:
+        out["output_calibration"] = {
+            "enabled": bool(oc.get("enabled")),
+            "apply_above": float(oc.get("apply_above", 0.0) or 0.0),
+            "score": {k: float(v) for k, v in (oc.get("score") or {}).items()},
+            "confidence": {k: float(v) for k, v in (oc.get("confidence") or {}).items()},
+        }
+    return out
+
+
 def _bar(v: float, n: int = 20) -> str:
     try:
         v = float(v)
@@ -669,8 +712,21 @@ def render_markdown(opinion: Dict[str, Any]) -> str:
 
     # 总体
     lines.append("## 总体意见")
-    lines.append(f"- 综合评分（回显）：{overall.get('overall_score_echo', 0.0):.3f}  {_bar(overall.get('overall_score_echo', 0.0))}")
-    lines.append(f"- 综合信心度（回显）：{overall.get('confidence_echo', 0.0):.3f}  {_bar(overall.get('confidence_echo', 0.0))}")
+    sc = float(overall.get("overall_score_echo", 0.0) or 0.0)
+    cf = float(overall.get("confidence_echo", 0.0) or 0.0)
+    lines.append(f"- 综合评分（回显）：{sc:.3f}  {_bar(sc)}")
+    lines.append(f"- 综合信心度（回显）：{cf:.3f}  {_bar(cf)}")
+    rs = overall.get("overall_score_raw_echo")
+    rc = overall.get("confidence_raw_echo")
+    try:
+        rsf = float(rs) if rs is not None else sc
+        rcf = float(rc) if rc is not None else cf
+    except (TypeError, ValueError):
+        rsf, rcf = sc, cf
+    if abs(sc - rsf) > 0.02 or abs(cf - rcf) > 0.02:
+        lines.append(
+            f"- 原始尺度（用于 verdict，未做输出校准）：综合分 {rsf:.3f}，信心度 {rcf:.3f}"
+        )
     lines.append("")
     if overall.get("summary"):
         lines.append(overall["summary"])
@@ -716,7 +772,11 @@ def render_markdown(opinion: Dict[str, Any]) -> str:
         label = DIM_LABELS_ZH.get(dim, dim)
         blk = dims.get(dim, {}) or {}
         lines.append(f"### {label}（{dim}）")
-        lines.append(f"- 评分回显：{blk.get('score_echo', 0.0):.3f}  {_bar(blk.get('score_echo', 0.0))}")
+        se = float(blk.get("score_echo", 0.0) or 0.0)
+        sraw = float(blk.get("score_raw_echo", se) or 0.0)
+        lines.append(f"- 评分回显：{se:.3f}  {_bar(se)}")
+        if abs(se - sraw) > 0.02:
+            lines.append(f"- 原始尺度：{sraw:.3f}（verdict 与关键维度阈值参考此尺度）")
         lines.append("")
         if blk.get("summary"):
             lines.append(blk["summary"])
@@ -745,6 +805,17 @@ def render_markdown(opinion: Dict[str, Any]) -> str:
             dw = scoring["dimension_weight"]
             order_str = ", ".join([f"{d}:{dw.get(d, 0.0):.2f}" for d in DIM_ORDER if d in dw])
             lines.append(f"- 维度权重：{order_str}")
+        oc = scoring.get("output_calibration") or {}
+        if oc.get("enabled"):
+            lines.append(
+                "- 输出校准 output_calibration：已启用；报告中的综合分、信心度与维度分为校准后值，"
+                "原始分见 metrics.json 的 overall_score_raw、overall_confidence_raw 与各维度 avg_raw。"
+            )
+            lines.append(
+                f"  - apply_above={float(oc.get('apply_above', 0.0)):.2f}；"
+                f"score: scale={float((oc.get('score') or {}).get('scale', 1.0)):.3f}, offset={float((oc.get('score') or {}).get('offset', 0.0)):.3f}；"
+                f"confidence: scale={float((oc.get('confidence') or {}).get('scale', 1.0)):.3f}, offset={float((oc.get('confidence') or {}).get('offset', 0.0)):.3f}"
+            )
         lines.append("")
 
     if metrics_path:
@@ -858,6 +929,7 @@ def main():
 
         cleaned_dims[dim] = {
             "score_echo": float(m.get("avg", 0.0) or 0.0),
+            "score_raw_echo": float(m.get("avg_raw", m.get("avg", 0.0)) or 0.0),
             "alignment_echo": float(m.get("avg_alignment", 0.0) or 0.0),
             "drift_echo": float(m.get("avg_drift", 0.0) or 0.0),
             "summary": summary,
@@ -888,13 +960,7 @@ def main():
         },
         "overall_opinion": overall_block,
         "dimensions": cleaned_dims,
-        "scoring_explainer": {
-            # 只回显最关键的几项，便于报告中解释“分是怎么算出来的”
-            "consistency_weight": float((metrics.get("config_used") or {}).get("consistency_weight", 0.20) or 0.20),
-            "dimension_weight": {
-                k: float(v) for k, v in ((metrics.get("config_used") or {}).get("dimension_weight") or {}).items()
-            }
-        }
+        "scoring_explainer": _build_scoring_explainer(metrics)
     }
 
     write_json(json_path, opinion)

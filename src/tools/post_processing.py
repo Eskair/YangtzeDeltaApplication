@@ -171,6 +171,29 @@ def _tokens_for_alignment(s: str):
     return unigrams, bigrams
 
 
+def _qa_alignment_ratio(question: str, answer: str) -> float:
+    """题干与答案正文之间的带权重 token 重合度（中英），不注入题干到 corpus，避免循环虚高。"""
+    if not (question or "").strip() or not (answer or "").strip():
+        return 0.0
+    q_uni, q_bi = _tokens_for_alignment(question)
+    if not q_uni:
+        return 0.0
+    a_uni, a_bi = _tokens_for_alignment(sanitize_for_scoring(answer))
+    if not a_uni:
+        return 0.0
+    return _weighted_overlap(q_uni, q_bi, a_uni, a_bi)
+
+
+def _blend_hint_and_qa(hint_score: float, question: str, answer: str, valid_hints: int) -> float:
+    """当检索 hints 与正文语言/体裁不一致时，用问答贴合度抬升对齐信号。"""
+    qa = _qa_alignment_ratio(question or "", answer or "")
+    if qa <= 0.05:
+        return max(0.0, min(1.0, hint_score))
+    # hints 越多且偏「检索词」，问答重合权重略提高
+    w_qa = 0.38 if valid_hints >= 2 else 0.44
+    return max(0.0, min(1.0, (1.0 - w_qa) * hint_score + w_qa * qa))
+
+
 def _weighted_overlap(q_uni, q_bi, c_uni, c_bi):
     """基于问题/提示 tokens 与候选 tokens 的带权重重合度，bigrams 轻度加成。"""
     if not q_uni:
@@ -284,7 +307,17 @@ DEFAULT_CONF = {
     "bar_symbols": 20,
     "adv_topk": 5,
     "report_width": 92,
-    "unknown_warn_ratio": 0.10
+    "unknown_warn_ratio": 0.10,
+
+    # ========= 输出校准（仿射映射到更可读区间；保留 *_raw 供审计）=========
+    # 典型案卷在「无检索 + 中英混杂」场景下 raw 分常被压在 0.42–0.52；
+    # 对 raw≥apply_above 的维度/综合分做温和抬升，使「完整材料」更易落在 0.70+（约 7/10）。
+    "output_calibration": {
+        "enabled": True,
+        "apply_above": 0.14,
+        "score": {"scale": 1.22, "offset": 0.188},
+        "confidence": {"scale": 1.12, "offset": 0.168}
+    }
 }
 
 PUNC = set(string.punctuation + "，。；：！？、（）【】《》…—-·")
@@ -600,9 +633,10 @@ def _alignment_ratio(dim: str, auth_hints: list, answer: str, topic_tags: list, 
     corpus = " \n ".join(pool)
     c_uni, c_bi = _tokens_for_alignment(corpus)
 
-    # 无提示词：给一个中性保底
+    # 无提示词：给一个中性保底，并可与问答贴合度混合
     if not auth_hints:
-        return 0.35 if c_uni else 0.0
+        base = 0.35 if c_uni else 0.0
+        return _blend_hint_and_qa(base, question or "", answer or "", 0)
 
     cover_hits = 0
     scores = []
@@ -620,14 +654,16 @@ def _alignment_ratio(dim: str, auth_hints: list, answer: str, topic_tags: list, 
 
     # 若所有 hints 切完都无有效 token，则当作“无 hint 场景”，给保底分
     if valid_hints == 0:
-        return 0.5 if c_uni else 0.0
+        base = 0.5 if c_uni else 0.0
+        return _blend_hint_and_qa(base, question or "", answer or "", 0)
 
     if not scores:
         return 0.0
 
     coverage = cover_hits / max(1, valid_hints)
     mean_hit = sum(scores) / len(scores)
-    return max(0.0, min(1.0, 0.5 * coverage + 0.5 * mean_hit))
+    hint_score = max(0.0, min(1.0, 0.5 * coverage + 0.5 * mean_hit))
+    return _blend_hint_and_qa(hint_score, question or "", answer or "", valid_hints)
 # === END PATCH ===
 
 
@@ -981,6 +1017,8 @@ def select_best_candidate(cands: list, cfg: dict, dim: str, auth_hints: list, q_
 
     k1 = cfg["consistency_correction"]["k_contradiction"]
     beta_raw = max(0.0, min(1.0, (1 - k1 * avg_ctr) * (0.5 + 0.5 * avg_jac)))
+    # 多候选时 Jaccard 常偏低，避免 β 把 α 压得过低
+    beta_raw = max(0.54, beta_raw)
 
     scored = []
     for idx, c in enumerate(cands):
@@ -1068,6 +1106,24 @@ def select_best_candidate(cands: list, cfg: dict, dim: str, auth_hints: list, q_
         "pairwise": {"avg_jaccard": avg_jac, "avg_contradiction": avg_ctr},
         "drop_stats": dict(drop_stats)
     }
+
+
+def _apply_output_calibration_scalar(x: float, kind: str, cfg: dict) -> float:
+    """
+    对综合/维度分或信心度做仿射校准。低于 apply_above 的极端低分不抬升，避免「空壳案卷」虚高。
+    kind: \"score\" | \"confidence\"
+    """
+    block = cfg.get("output_calibration") or {}
+    if not block.get("enabled"):
+        return x
+    th = float(block.get("apply_above", 0.0))
+    if x < th:
+        return x
+    sub = block.get("confidence" if kind == "confidence" else "score") or {}
+    s = float(sub.get("scale", 1.0))
+    o = float(sub.get("offset", 0.0))
+    return max(0.0, min(1.0, s * x + o))
+
 
 # ============================ 聚合与报告 ============================
 
@@ -1286,11 +1342,26 @@ def aggregate_dimensions(items: list, cfg: dict, qs_cfg: dict):
             }
         }
 
-    # overall
-    dim_score = 0.0
+    # overall：先按未校准维度分加权得到 raw，再写回校准后的维度 avg 并重新加权
+    dim_score_raw = 0.0
     weight_sum = 0.0
     total_q_count = len(per_question)
     unknown_q_count = len([1 for q in per_question if q["dimension"] == "unknown"])
+    for dim, info in per_dimension.items():
+        if dim not in DIM_ORDER:
+            continue
+        w = (cfg.get("dimension_weight") or {}).get(dim, 1.0)
+        dim_score_raw += w * float(info.get("avg", 0.0))
+        weight_sum += w
+    overall_score_raw = dim_score_raw / max(1e-9, weight_sum if weight_sum > 0 else 1.0)
+
+    for dim, info in per_dimension.items():
+        ar = float(info.get("avg", 0.0))
+        info["avg_raw"] = ar
+        info["avg"] = _apply_output_calibration_scalar(ar, "score", cfg)
+
+    dim_score = 0.0
+    weight_sum = 0.0
     for dim, info in per_dimension.items():
         if dim not in DIM_ORDER:
             continue
@@ -1309,7 +1380,8 @@ def aggregate_dimensions(items: list, cfg: dict, qs_cfg: dict):
     mean_conf = sum(all_conf) / max(1, len(all_conf))
     mean_jac = all_jac / max(1, cnt)
     mean_ctr = all_ctr / max(1, cnt)
-    overall_confidence = max(0.0, min(1.0, (0.5 * mean_conf + 0.3 * mean_jac + 0.2 * (1 - mean_ctr))))
+    overall_confidence_raw = max(0.0, min(1.0, (0.5 * mean_conf + 0.3 * mean_jac + 0.2 * (1 - mean_ctr))))
+    overall_confidence = _apply_output_calibration_scalar(overall_confidence_raw, "confidence", cfg)
 
     provider_summary = {}
     for pv, n in provider_stats.items():
@@ -1339,6 +1411,8 @@ def aggregate_dimensions(items: list, cfg: dict, qs_cfg: dict):
     overall = {
         "overall_score": overall_score,
         "overall_confidence": overall_confidence,
+        "overall_score_raw": overall_score_raw,
+        "overall_confidence_raw": overall_confidence_raw,
         "mean_pairwise_jaccard": mean_jac,
         "mean_pairwise_contradiction": mean_ctr,
         "unknown_ratio": (unknown_q_count / max(1, total_q_count)),
@@ -1367,6 +1441,12 @@ def build_report_md(pid: str, meta: dict, per_dim: dict, overall: dict, cfg: dic
     cf = overall["overall_confidence"]
     lines.append(f"- 综合评分（0~1）：**{sc:.3f}**  {bar(sc, cfg['bar_symbols'])}")
     lines.append(f"- 综合信心度（0~1）：**{cf:.3f}**  {bar(cf, cfg['bar_symbols'])}")
+    oc = cfg.get("output_calibration") or {}
+    if oc.get("enabled") and overall.get("overall_score_raw") is not None:
+        lines.append(
+            f"- 输出校准已启用：上为**展示分**；原始未校准综合 **{float(overall['overall_score_raw']):.3f}**、"
+            f"信心 **{float(overall['overall_confidence_raw']):.3f}**（各维度见下表 avg_raw）。"
+        )
     lines.append(f"- 全局一致性（平均 Jaccard）：**{overall['mean_pairwise_jaccard']:.3f}**")
     lines.append(f"- 全局冲突度（平均）：**{overall['mean_pairwise_contradiction']:.3f}**")
 
@@ -1402,6 +1482,8 @@ def build_report_md(pid: str, meta: dict, per_dim: dict, overall: dict, cfg: dic
         info = per_dim[dim]
         avg = info["avg"]
         lines.append(f"### {dim}  · 评分 {avg:.3f}  {bar(avg, cfg['bar_symbols'])}")
+        if oc.get("enabled") and "avg_raw" in info:
+            lines.append(f"- 原始 avg_raw：**{float(info['avg_raw']):.3f}**")
         if info.get("auth_hints"):
             lines.append(f"- 参考方向（非事实）：{'; '.join(info['auth_hints'])}")
         lines.append(f"- 对齐均值/漂移均值：**{info.get('avg_alignment', 0.0):.2f} / {info.get('avg_drift', 0.0):.2f}**")

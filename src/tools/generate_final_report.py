@@ -5,6 +5,7 @@
 功能：
   1) 自动读取：
        - refined_answers/<pid>/postproc/final_payload.json
+       - refined_answers/<pid>/postproc/metrics.json（若存在：一页摘要与第 2 节标尺说明）
        - expert_reports/<pid>/ai_expert_opinion.json
        - expert_reports/<pid>/ai_expert_opinion.md
   2) 生成综合 Markdown 报告：
@@ -31,6 +32,7 @@ import json
 import argparse
 from pathlib import Path
 from datetime import datetime
+from typing import Any, Dict, Optional
 
 # ========= 路径配置 =========
 BASE_DIR = Path(__file__).resolve().parents[2]   # 项目根（包含 src/）
@@ -96,6 +98,27 @@ def load_json(path: Path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _output_calibration_enabled(metrics: Optional[Dict[str, Any]]) -> bool:
+    cu = (metrics or {}).get("config_used") or {}
+    oc = cu.get("output_calibration") or {}
+    return bool(oc.get("enabled"))
+
+
+def _overall_raw_from_metrics(metrics: Optional[Dict[str, Any]]) -> Optional[tuple]:
+    """若 metrics 含 overall_*_raw，返回 (score_raw, conf_raw)，否则 None。"""
+    if not metrics:
+        return None
+    mo = metrics.get("overall") or {}
+    if "overall_score_raw" not in mo and "overall_confidence_raw" not in mo:
+        return None
+    try:
+        rs = float(mo.get("overall_score_raw", mo.get("overall_score", 0.0)) or 0.0)
+        rc = float(mo.get("overall_confidence_raw", mo.get("overall_confidence", 0.0)) or 0.0)
+        return rs, rc
+    except (TypeError, ValueError):
+        return None
+
+
 def detect_latest_pid() -> str:
     """
     从 refined_answers 下自动选一个“最新且有 postproc/final_payload.json + 对应专家评审”的 pid
@@ -147,9 +170,13 @@ def _fmt_float(v, ndigits=1, default="0.0"):
 
 
 # ========= 一页摘要生成 =========
-def build_executive_summary(expert_json: dict) -> str:
+def build_executive_summary(
+    expert_json: dict,
+    metrics: Optional[Dict[str, Any]] = None,
+) -> str:
     """
     基于 ai_expert_opinion.json 生成“0. 一页摘要（Executive Summary）”Markdown 文本。
+    若传入 postproc/metrics.json 解析结果，可与 output_calibration 对齐并回显权威 raw 分。
     如果 expert_json 为空，则返回空字符串，调用方自己判断是否插入。
     """
     if not expert_json:
@@ -190,10 +217,33 @@ def build_executive_summary(expert_json: dict) -> str:
         lines.append("- **总体结论（verdict）**：暂无明确结论")
     if brief_reason:
         lines.append(f"- **结论依据简述**：{brief_reason}")
-    lines.append(f"- **综合评分**：{_fmt_float(score, 3)}（0–1 区间）")
-    lines.append(f"- **信心度**：{_fmt_float(conf, 3)}")
+    try:
+        rs = float(overall.get("overall_score_raw_echo", score) or score)
+        rc = float(overall.get("confidence_raw_echo", conf) or conf)
+    except (TypeError, ValueError):
+        rs, rc = score, conf
+    mr = _overall_raw_from_metrics(metrics)
+    if mr is not None:
+        rs, rc = mr[0], mr[1]
+    calibrated_note = abs(rs - score) > 0.02 or abs(rc - conf) > 0.02
+    scale_help = calibrated_note or _output_calibration_enabled(metrics)
+    if calibrated_note:
+        lines.append(f"- **综合评分**：{_fmt_float(score, 3)}（0–1 区间，输出校准后读数）")
+        lines.append(f"- **信心度**：{_fmt_float(conf, 3)}（输出校准后读数）")
+        lines.append(
+            f"- **原始尺度**（verdict 判定依据，未做输出校准）：综合评分 {_fmt_float(rs, 3)}，信心度 {_fmt_float(rc, 3)}"
+        )
+    else:
+        lines.append(f"- **综合评分**：{_fmt_float(score, 3)}（0–1 区间）")
+        lines.append(f"- **信心度**：{_fmt_float(conf, 3)}")
     lines.append("")
     lines.append("> **评分区间说明（供非技术评审参考）**：")
+    if scale_help:
+        lines.append(
+            "> - 下列 **0.62 / 0.45** 阈值针对本页「综合评分」行中的 **0–1 读数**；"
+            "若该行已标注为「输出校准后读数」，请按**校准后的分**对照区间。"
+            "**verdict** 仍以「原始尺度」一行为准（与 `metrics.json` 中 `overall_*_raw` 一致）。"
+        )
     lines.append("> - ≥ 0.62：整体条件较好，可在控制风险前提下推进；")
     lines.append("> - 0.45–0.62：信息不充分或优劣并存，建议补充材料后再决策；")
     lines.append("> - < 0.45：关键维度存在明显短板或高不确定性，一般不建议立项。")
@@ -222,7 +272,10 @@ def build_executive_summary(expert_json: dict) -> str:
 
 
 # ========= 维度问答部分 =========
-def build_qa_section_from_final_payload(final_payload: dict) -> str:
+def build_qa_section_from_final_payload(
+    final_payload: dict,
+    metrics: Optional[Dict[str, Any]] = None,
+) -> str:
     """
     输入：postproc/final_payload.json（dict）
     输出：Markdown 文本（每个维度下：
@@ -238,6 +291,11 @@ def build_qa_section_from_final_payload(final_payload: dict) -> str:
     lines.append("")
     lines.append("> 本部分基于 post_processing 选中的问答结果生成，用于支撑专家评审结论的溯源。")
     lines.append("> 如阅读时间有限，可主要关注「0. 一页摘要」与「1. AI 专家总体评审」，本部分主要面向技术评审与审计。")
+    if _output_calibration_enabled(metrics):
+        lines.append(
+            "> 各维度标题中的「综合得分 /100」来自 `final_payload`，与 post_processing 写入的**校准后**维度均值一致；"
+            "逐题「置信度」「对齐度」等元字段为模型/后处理原始信号，**未**做输出校准仿射。"
+        )
     lines.append("")
 
     for dim in DIM_ORDER:
@@ -387,6 +445,11 @@ def main():
     if expert_json_path.exists():
         expert_json = load_json(expert_json_path)
 
+    metrics: Dict[str, Any] = {}
+    metrics_json_path = postproc_dir / "metrics.json"
+    if metrics_json_path.exists():
+        metrics = load_json(metrics_json_path)
+
     REPORT_ROOT.mkdir(parents=True, exist_ok=True)
     out_path = REPORT_ROOT / f"{pid}_final_report.md"
 
@@ -407,7 +470,7 @@ def main():
     report_lines.append("")
 
     # 0. 一页摘要（如果有 ai_expert_opinion.json）
-    exec_summary_md = build_executive_summary(expert_json)
+    exec_summary_md = build_executive_summary(expert_json, metrics)
     if exec_summary_md:
         report_lines.append(exec_summary_md)
         report_lines.append("")
@@ -421,7 +484,7 @@ def main():
     _write_progress(2, 4, pid)
 
     # 2. 维度问答与打分依据（来自 final_payload.json 的问题 + 选中的一个回答）
-    qa_section = build_qa_section_from_final_payload(final_payload)
+    qa_section = build_qa_section_from_final_payload(final_payload, metrics)
     report_lines.append(qa_section)
     report_lines.append("")
     _write_progress(3, 4, pid)
