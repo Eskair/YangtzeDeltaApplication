@@ -21,14 +21,21 @@ Stage 1 · 块级事实抽取器（extract_facts_by_chunk.py）
   4）扩充关键词推断逻辑 _infer_dims_from_text，补充 objectives / innovation / feasibility 等隐性表述。
   5）在运行结束时输出五个维度的事实数量分布，并对明显偏少的维度给出警告，便于调参与排错。
   6）新增：对“文本很长但抽取事实过少”的 chunk 自动再跑一轮 dense 模式，强化召回。
+  7）按 dense / JSON 重试轮次动态提高输出 token 上限，降低截断导致 JSON 非法的概率。
+  8）跨 chunk 按规范化文本去重，减轻 overlap 带来的重复事实写入 raw_facts.jsonl。
+  9）主提示词由 build_fact_prompt() 按当前领域配置的 dimensions/type 动态拼装，减少枚举漂移。
+ 10）主提示词通过 material_domain_zh 提供可选「材料形态」说明（投融资、市场、合规等常见片段），
+     帮助模型识别各类商业书面材料；具体行业以原文为准，YAML 可覆盖。
+ 11）材料语域长段说明来自 src.config.material_domain_zh（default.yaml），与 build_dimensions 共用。
 """
 
 import os
 import json
 import argparse
+import inspect
 import re
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Mapping
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -51,7 +58,7 @@ def _write_progress(done: int, total: int, pid: str = "") -> None:
     except Exception:
         pass
 
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.2")
 
 client = None  # lazy-initialized to avoid import-time side effects
 
@@ -105,90 +112,144 @@ def _get_type_to_dims_map():
 VALID_DIMENSIONS = _get_valid_dimensions()
 VALID_TYPES = _get_valid_types()
 
-# ⚠️ Prompt：既要防幻觉，又要尽量“捞干净”五维相关信息，并保证多维覆盖
-FACT_PROMPT = """
+# type 字段说明：与 _get_valid_types() 默认集对齐；未知 type 由 build_fact_prompt 泛化一行
+_TYPE_FIELD_HELP: Mapping[str, str] = {
+    "team_member": "成员身份、任职机构（如××有限公司/股份有限公司/（有限合伙））、职责、行业经验与项目角色",
+    "org_structure": "团队/公司股权与治理结构、部门分工、核心岗位占比",
+    "collaboration": "战略客户、渠道伙伴、供应商/代工厂、校企或产业联盟、联合推广等协同模式",
+    "resource": "产线、仓网、数据平台、牌照资质、关键设备或合作资源等",
+    "pipeline": "产品线/业务线、SKU 或服务模块的目标、交付节奏；若原文为医疗语境可含适应症/管线（以原文为准）",
+    "milestone": "版本发布、门店/产线爬坡、融资交割、上市节点、关键合同签署等含时间的里程碑",
+    "market": "赛道规模、增速/CAGR、市占率、竞品对比、客单价、区域/渠道结构、估值与收入预测等商业量化信息",
+    "tech_route": "产品研发路线、架构选型、供应链数字化、SaaS 多租户方案等技术与交付路径",
+    "product": "产品形态（软硬件/SaaS/平台）、SKU、交付方式、订阅与定价、客户场景",
+    "ip_asset": "专利/软著/商标、核心算法与数据资产、排他协议或关键 know-how",
+    "evidence": "试点/POC、客户案例与标杆订单、复购与留存数据；或研发侧测试与验证结论（以原文为准）",
+    "budget_item": "研发/市场/人力/资本开支等分阶段预算、毛利/费用结构、单店或单客户经济模型中的数字",
+    "funding_source": "自有资金、天使/A/B 轮、战略投资、领投/跟投、政府或产业基金、可转债等融资安排",
+    "risk": "市场、竞争、供应链、现金流、合规与数据安全、关键人依赖等风险或不确定性",
+    "mitigation": "对上述风险的具体应对、预案、合规与内控措施",
+    "ai_model": "所采用的模型/算法/架构或智能化能力（若原文提及）",
+    "clinical_design": "若原文为医疗/临床：试验阶段、入组与终点；若为商业项目：灰度发布、抽样审计、效果评估方案等验证设计——仅当原文出现该结构时抽取",
+    "regulatory": "上市合规、行业准入、数据安全与隐私、广告与营销合规、跨境经营许可等（区别于纯市场规模数字）",
+    "other": "无法归类但又与项目有关的事实",
+}
+
+
+def _format_type_catalogue(types: List[str]) -> str:
+    lines = []
+    for t in types:
+        desc = _TYPE_FIELD_HELP.get(t)
+        if desc:
+            lines.append(f'- "{t}": {desc}')
+        else:
+            lines.append(
+                f'- "{t}": 与项目内容相关（此 type 来自当前领域配置）；结合文本从允许列表中选择。'
+            )
+    return "\n".join(lines)
+
+
+def _format_dimension_help(dimensions: List[str]) -> str:
+    """Short human-readable line per default five-dim set; unknown dims get generic line."""
+    known = {
+        "team": "创始人/高管/核心骨干、组织与股权、激励与关键人、客户成功或交付团队等",
+        "objectives": "营收与毛利目标、市场份额/门店数/GMV、融资里程碑、产品路线图上的阶段性目标等",
+        "strategy": "GTM 与渠道、定价与回款、供应链与成本、竞争策略、合作伙伴与生态、监管与上市路径中的经营策略等",
+        "innovation": "技术/产品/商业模式差异化、专利与数据壁垒、与竞品对比的明确优势等",
+        "feasibility": "现金流与融资用途、产能与交付、合规与数据安全、实施计划与风险应对等",
+    }
+    lines = []
+    for d in dimensions:
+        if d in known:
+            lines.append(f'- "{d}": {known[d]}')
+        else:
+            lines.append(f'- "{d}": 与评估维度「{d}」相关的事实（来自当前领域配置）。')
+    return "\n".join(lines)
+
+
+def build_fact_prompt() -> str:
+    """
+    组装 Stage1 主提示词：dimensions/type 与 src.config 当前返回值一致，避免枚举漂移。
+    """
+    dimensions = _get_valid_dimensions()
+    types = _get_valid_types()
+    dims_join = ", ".join(f'"{d}"' for d in dimensions)
+    type_catalogue = _format_type_catalogue(types)
+    dim_help = _format_dimension_help(dimensions)
+
+    body = f"""
 你是一个“事实抽取器”，负责从一小段提案文本中【逐条抽取原子事实】。
+
+【材料语域（与 src/config 共用；修改请编辑 src/config/*.yaml 的 material_domain_zh）】
+__MATERIAL_DOMAIN_ZH_PLACEHOLDER__
 
 ⚠️ 非常重要的硬性约束（请逐条遵守）：
 1）你只处理当前这一个文本块，不要猜测其他页面或上下文的内容。
-2）不允许编造任何文本中没有出现的：机构、人物、公司、医院、国家、城市、疾病名称、药物名、
-   技术名称、模型名称、项目名称、市场规模、患者数量、CAGR 或其他具体数字。
+2）不允许编造任何文本中没有出现的：机构、人物、公司、客户、供应商、投资人、国家、城市、
+   技术/产品/模型名称、商标、项目名称、市场规模、估值、融资额、收入/毛利、市占率、CAGR 或其他具体数字。
+   金额、百分比、量纲尽量沿用原文写法（阿拉伯数字、中文「万/亿/千万」、千分位、全角/半角等），便于后续自动核验。
+   若原文为医疗/医药语境且出现疾病名、药物名、适应症等，仅可忠实摘录，不得补充未出现的医学结论。
 3）禁止使用“可能 / likely / 一般认为 / 通常 / 预计 / 大多 / 被认为 / typically / usually / generally /
    probably / potentially / it is believed that”等带有推测性的词语，
    除非这些词本身已经出现在原文中并且你是在忠实复述原文。
 4）每条 fact 必须能在原文中找到对应内容，可以轻微改写，但必须保留原文中的关键短语
-   （例如技术名称、机构名称、管线名称、疾病名称、模型名称等）。
+   （例如公司全称带「有限公司」「股份有限公司」「（有限合伙）」、领投/跟投与轮次、产品名、竞品名、关键数字等）。
 5）每条 fact 尽量控制在 1–2 句内，不要写成长段落；尽量保持具体、可验证。
 
 【目标领域】
-- 通用项目/提案分析（技术、商业、研究等各类项目均适用）
-- 你不能凭空假设具体领域，只能按文本本身来。
+- 上文「材料语域」仅帮助识别常见商业信息形态；**若与当前文本类型不符，忽略其暗示，只按原文抽取**，不要强行套用商业叙事。
+- 你不能凭空假设未出现的行业或数据，只能按文本本身来。
+
+【常见商业项目表述形态（仅原文出现时才抽取，勿编造）】
+- **融资与资本**：轮次（天使/A/B…）、领投/跟投、投前投后估值、募资用途、可转债/SAFE 等 → 多用 type "funding_source" / "budget_item"，并与 dimensions 中 objectives/feasibility/strategy 等联动。
+- **经营与财务**：收入、毛利/毛利率、费用、现金流、单店模型、订单与 backlog、复购等 → "market" / "budget_item" / "evidence" 等按语义选择。
+- **市场与竞争**：市占、竞品对比、价格带、渠道结构、区域扩张、客户案例与标杆客户 → "market" / "collaboration" / "evidence"。
+- **产品与交付**：产品线、SKU、SaaS 版本迭代、供应链与履约、交付周期 → "product" / "pipeline" / "tech_route"。
+- **合规与资产**：上市与监管路径、数据安全与隐私、知识产权与软著商标 → "regulatory" / "ip_asset"。
 
 【什么是“原子事实”？】
 - 一条 fact 应该尽量只表达“一个相对独立、可以单独复述的事实”；
 - 不要把很多主题揉成一条长句；
-- 如果一句话里同时提到了“团队配置”和“里程碑时间表”，请拆成两条 facts。
-- 如果一句话中包含多个独立的重要信息（例如“团队背景 + 技术路线 + 目标市场”），也应拆成多条 facts。
+- 若同句同时出现「团队配置」与「下一轮融资里程碑」，或「供应链方案」与「目标市占」，请拆成多条 facts。
+- 若一句里包含多个独立要点（例如「团队背景 + SaaS 多租户路线 + 华东渠道目标」），也应拆成多条 facts。
 
 【高优先级内容（必须尽量完整抽取）】
-- 如果文本中出现“项目团队 / 核心成员 / 负责人 / CEO / COO / 联合创始人 / 教授 / 博士”等介绍，
-  请为每位成员拆分出多条事实，至少包括：
-  - 职务 / 身份 + 所在机构（大学 / 医院 / 公司等）；
-  - 主要研究方向或业务领域；
-  - 与本项目相关的关键经验或成功案例（如：曾主导某类产品上市、带领团队完成某阶段研发、
-    负责过重大合作项目、带来显著业务增长等）。
-- 如果文本中出现“市场分析”相关内容（例如市场规模、CAGR、增长率、各区域市场份额、主要竞争对手、
-  销售额、客户群体、竞争格局等），请将每一条重要数字和结论拆分成单独的事实，并统一标记 type="market"。
-  不要用一句话模糊带过整段市场分析。
+- 若文本出现**核心团队 / 创始人 / 高管 / 业务负责人**等：为每位关键人拆分多条事实，包括：
+  - 职务与任职主体（尽量保留「××有限公司」「股份有限公司」「（有限合伙）」等法定名称片段）；
+  - 与当前项目相关的经历（如曾负责某品类从 0 到 1、主导关键客户签约、搭建供应链体系等，须原文有据）。
+- 若文本出现**融资与市场**内容：对轮次、领投/跟投、估值、募资用途、市占与竞品、收入与毛利预测、渠道与客户案例等，
+  **每条重要数字或结论单独一条 fact**；市场与竞争量化多用 type="market"，资金安排多用 "funding_source" / "budget_item"。
+- 若文本出现**市场分析**段落（规模、增速、区域、竞品、定价与支付方等）：拆条抽取并优先 type="market"，勿用一句笼统概括整段。
 
-【抽取数量与粒度要求】
-- 请尽量把长句拆成多条事实，保证每条 fact 聚焦一个主题；
-- 如果当前文本块信息比较丰富，请尽量抽取 15–25 条 facts；
-- 如果信息很少，可以少于 10 条，甚至为空；但不要因为“懒”而漏掉清晰的事实。
-- 事实总数上限为 25 条，请不要超过 25 条。
+【抽取数量与粒度要求】（全篇统一：任何模式、任何重试下 facts 总数硬上限为 25 条）
+- 请尽量把长句拆成多条事实，保证每条 fact 聚焦一个主题。
+- 当本块**明显包含多段、多主题**信息时，在**不超过 25 条**的前提下尽量多抽（例如约 15–25 条）；**不要为凑条数编造**。
+- 当本块**只围绕一个主题**或信息较少时，**少而准优于硬凑**；可以少于 10 条甚至返回 {{"facts": []}}，但不要漏掉清晰事实。
+- **任何情况下不得超过 25 条 facts**。
 
 【维度标签（dimensions 的含义）】
-- "team":    任何跟“团队、个人、机构、角色、分工、协同”相关的事实
-- "objectives": 项目的总体目标、阶段性目标、KPI、各条管线/子项目的目标等
-- "strategy":   技术路线、开发/监管路线、合作/商业策略、市场进入策略、运营模式等
-- "innovation": 技术/产品/模式的创新点、与现有方案对比、专利和独特资源、证据优势等
-- "feasibility": 资源基础、预算和资金、实施路径、风险与应对、时间规划等
+{dim_help}
 
 ⚠️ 维度标注的硬性要求：
 - 只要某条 fact 明显与上述任一维度有关，就必须把对应维度写进 dimensions。
 - 一条 fact 可以同时属于多个维度（例如 ["team","strategy"]）。
 - 每条 fact 的 dimensions 至少要包含 1 个标签；如果你真的无法判断，请使用 ["feasibility"] 兜底。
-- 宁可多标维度、也不要让相关的 fact 没有维度标签。
+- 「宁可多标维度」是指：针对不同**信息点**分别标注；**不要在同一件事的表述上重复拆成多条几乎相同的 facts**。
 
-【type 可选值】
-- "team_member": 某个成员的身份、机构、研究方向、项目角色
-- "org_structure": 团队/公司结构、分工、比例
-- "collaboration": 国际合作、校企合作、国内外协同模式
-- "resource": 实验室、平台、数据、合作资源等
-- "pipeline": 某条管线/子项目的目标、适应症、技术路线
-- "milestone": 某个阶段的具体任务/里程碑（含时间信息）
-- "market": 市场规模、CAGR、主要国家/客户、市场驱动因素、竞争格局等
-- "tech_route": 技术/算法/实验路线（例如 AI 设计流程、产品开发流程）
-- "product": 产品/平台形态、商业模式等
-- "ip_asset": 专利、专有技术、独特数据资源
-- "evidence": 实验验证/测试/真实世界数据及其结论
-- "budget_item": 某个阶段/用途的预算金额或成本构成
-- "funding_source": 资金来源（自有、VC、资助、合作等）
-- "risk": 技术/市场/资金/法规/AI 等方面的风险或不确定性
-- "mitigation": 上述风险对应的应对措施或缓解策略
-- "ai_model": 具体 AI 模型/算法/架构的描述
-- "clinical_design": 试验/验证设计（阶段、入组标准、终点指标等）
-- "regulatory": 法规路径、合规审批、注册策略、行业准入政策等
-- "other": 无法归类但又与项目有关的事实
+【type 可选值】（以下为当前任务允许的 type 字符串，**必须与之一完全一致**）
+{type_catalogue}
 
 【标注提示（通用规则）】
-- 提到市场规模、CAGR、目标国家/客户、竞争者、支付/报销 → type 一般用 "market" 或 "regulatory"
-- 提到资金、预算、成本、阶段性投入 → type 一般用 "budget_item" 或 "funding_source"
-- 提到风险、不确定性、瓶颈、挑战 → type 用 "risk"
-- 提到“如何应对某风险/问题” → type 用 "mitigation"
-- 提到具体 AI 模型/算法/架构 → type 用 "ai_model"
-- 提到专利号、PCT、核心 IP、独特数据集 → type 用 "ip_asset"
-- 如果你不确定 type 应该是什么，可以用 "other"，但尽量根据内容选择一个最接近的类型。
+- 市场规模、增速/CAGR、市占、竞品对比、销售额/订单、渠道结构、客户画像、支付与账期（非单纯合规流程）→ "market"
+- 上市与行业准入、数据安全与隐私、广告与营销合规、跨境许可等 → "regulatory"
+- 融资轮次、领投/跟投、战略投资、政府/产业基金、募资用途与资金到账安排 → 优先 "funding_source"；具体金额拆分也可 "budget_item"
+- 费用预算、CAPEX/OPEX、分阶段投入与毛利结构中的数字 → "budget_item"
+- 风险、不确定性、瓶颈、挑战 → "risk"；明确应对与预案 → "mitigation"
+- 客户试点、标杆案例、POC/试点数据、订单与复购描述 → 常用 "evidence" 或 "market"（择更贴近语义者）
+- 产品形态、SKU、订阅与交付 → "product"；研发与架构路线 → "tech_route"
+- 具体 AI/算法/模型（若原文点名）→ "ai_model"
+- 专利/软著/商标、核心数据资产 → "ip_asset"
+- 若不确定 type，可用 "other"，但请优先选最接近的类型。
 
 【维度覆盖要求（非常重要）】
 - 如果该文本块中同时出现了团队信息、项目目标、技术/商业策略、创新亮点、可行性/风险等多种内容，
@@ -198,19 +259,33 @@ FACT_PROMPT = """
 - 当你需要“取舍”时，优先保留能代表不同维度、不同主题的事实，而不是在同一个小点上反复细化。
 
 【输出格式要求】
-- 必须返回一个 JSON 对象，顶层只有一个键 "facts"
-- "facts" 是一个数组，数组里是若干个事实对象
-- 每个事实对象必须是这种结构：
-  {
-    "text": "用自然语言写的一条事实（1–2 句，尽量具体）",
-    "dimensions": ["team", "strategy"],   // 从 ["team","objectives","strategy","innovation","feasibility"] 中选一到多个
-    "type": "team_member"                 // 从上面给出的 type 列表中选一个
-  }
-- 不要输出 meta 字段，meta 信息由系统自动补充。
-- 如果当前文本块没有任何有用事实，可以返回 {"facts": []}
-- 不要输出任何解释文字，不要加注释，只输出 JSON。
+- 只输出**一个** JSON 对象；**不要**使用 markdown 代码围栏（不要使用 ``` 包裹）。
+- 顶层**只能**包含键 "facts"，**不要**添加其他任何顶层键。
+- "facts" 为数组；数组元素仅含字段 "text"（字符串）、"dimensions"（字符串数组）、"type"（字符串）。
+- dimensions 中每一项必须从以下集合选取（可多个）：{dims_join}
+- type 必须从本节【type 可选值】列表中的字符串**原样**选取其一。
+- JSON 必须可被标准解析器解析：字符串内的引号、换行等必须正确转义；**禁止**在 JSON 中使用 // 或 /* */ 注释。
+- 不要输出 meta 字段（由系统自动补充）。
+- 若无有用事实，返回 {{"facts": []}}。
+- 除该 JSON 外不要输出任何解释性自然语言。
+
+【与分块重叠的说明】
+- 相邻文本块可能因重叠而包含相同原文片段；对同一条信息请尽量保持与原文**关键短语一致**的写法，避免同义反复拆成多条几乎相同的事实（允许忠实前提下轻微压缩表述）。
+
 现在开始处理我给你的文本块。
 """
+    try:
+        from src.config import material_domain_zh_for_prompts
+
+        md = material_domain_zh_for_prompts()
+    except Exception:
+        md = ""
+    if not md.strip():
+        md = (
+            "各类商业项目评审材料（投融资计划书、可行性研究、招标与响应文件、公司介绍、备忘录等），行业不限。\n"
+            "中文或以中文为主、中英混排较为常见；若为纯外文、临床方案、科研课题等，仅以原文为准，勿套用未出现的商业要素。"
+        )
+    return body.replace("__MATERIAL_DOMAIN_ZH_PLACEHOLDER__", md.strip())
 
 
 def find_latest_prepared_proposal() -> str:
@@ -272,6 +347,47 @@ def make_chunks(text: str, max_chars: int = 1800, overlap: int = 400) -> List[Di
     return chunks
 
 
+_max_output_param_name: Optional[str] = None
+
+
+def _max_output_kw_name(client: OpenAI) -> str:
+    """Prefer max_completion_tokens when the SDK exposes it; else max_tokens."""
+    global _max_output_param_name
+    if _max_output_param_name is not None:
+        return _max_output_param_name
+    try:
+        sig = inspect.signature(client.chat.completions.create)
+        params = sig.parameters
+        if "max_completion_tokens" in params:
+            _max_output_param_name = "max_completion_tokens"
+        elif "max_tokens" in params:
+            _max_output_param_name = "max_tokens"
+        else:
+            _max_output_param_name = "max_tokens"
+    except (TypeError, ValueError):
+        _max_output_param_name = "max_tokens"
+    return _max_output_param_name
+
+
+def _max_completion_budget(dense: bool, attempt: int) -> int:
+    """
+    Output token budget for chat.completions.
+    dense 模式要求更多 facts，JSON 体积大；JSON 解析失败后的重试再略放宽。
+    """
+    if dense:
+        return 8192
+    if attempt > 1:
+        return 6144
+    return 4096
+
+
+def _fact_dedup_key(text: str) -> str:
+    """Normalize fact text for cross-chunk deduplication (overlap regions)."""
+    t = (text or "").strip()
+    t = re.sub(r"\s+", " ", t)
+    return t.casefold()
+
+
 def call_llm_for_chunk(chunk_text: str, attempt: int = 1, dense: bool = False) -> Dict[str, Any]:
     """
     调用 OpenAI，对单个 chunk 抽取 facts。
@@ -282,15 +398,16 @@ def call_llm_for_chunk(chunk_text: str, attempt: int = 1, dense: bool = False) -
 
     if attempt > 1:
         extra_hint_parts.append(
-            "⚠️ 注意：上一次你返回的 JSON 因为太长或不合法导致解析失败。"
-            "这一次请严格控制 facts 数量不超过 18 条，并且务必保证 JSON 语法完全正确。"
+            "⚠️ 注意：上一次返回的 JSON 解析失败（可能因截断或转义错误）。"
+            "请在 facts 总数不超过 25 条的前提下，优先输出一份合法、完整的 JSON；"
+            "若必要可适当减少条数，但仍应覆盖本块中最重要的、可分属不同维度的信息。"
         )
 
     if dense:
         extra_hint_parts.append(
-            "⚠️ 当前文本块信息非常丰富，你在本次抽取时应尽量覆盖文本中出现的所有与团队、目标、"
-            "策略、创新、可行性相关的关键事实。请优先抽取 15–22 条 facts，"
-            "并尽量覆盖不同维度和不同主题，不要只聚焦在单一方面。"
+            "⚠️ 本块较长但上次抽取偏少。请在 facts 总数不超过 25 条的前提下，"
+            "尽量补全本块中与团队、目标、策略、创新、可行性相关的关键事实，并覆盖不同主题；"
+            "不要只聚焦单一侧面；不要为凑条数编造。"
         )
 
     extra_hint = ""
@@ -300,23 +417,27 @@ def call_llm_for_chunk(chunk_text: str, attempt: int = 1, dense: bool = False) -
     messages = [
         {
             "role": "system",
-            "content": "你是一个严谨的事实抽取器，只能基于给定文本块抽取原子事实，不得编造。适用于任何领域的项目提案。",
+            "content": "你是一个严谨的事实抽取器，只能基于给定文本块抽取原子事实，不得编造。"
+            "典型输入为各类商业与投融资书面材料（不限行业）；若文本类型不同，仍以原文为准，勿套用未出现的要素。",
         },
         {
             "role": "user",
-            "content": FACT_PROMPT
+            "content": build_fact_prompt()
             + extra_hint
             + "\n\n=== 文本块开始 ===\n"
             + chunk_text.strip(),
         },
     ]
 
-    resp = _get_client().chat.completions.create(
+    cli = _get_client()
+    out_budget = _max_completion_budget(dense, attempt)
+    out_kw = {_max_output_kw_name(cli): out_budget}
+    resp = cli.chat.completions.create(
         model=OPENAI_MODEL,
         messages=messages,
         response_format={"type": "json_object"},
         temperature=0.0,
-        max_tokens=1800,
+        **out_kw,
     )
 
     raw = resp.choices[0].message.content
@@ -342,13 +463,14 @@ def call_llm_for_chunk(chunk_text: str, attempt: int = 1, dense: bool = False) -
 
 _MARKET_CN = [
     "市场", "市场规模", "市场容量", "市场需求", "市场前景", "市场潜力",
-    "目标市场", "细分市场", "市场份额", "渗透率",
+    "目标市场", "细分市场", "市场份额", "市占率", "市占", "渗透率",
     "客户", "客户群体", "目标客户", "目标人群",
     "患者群体", "目标患者",
-    "销售", "销售额", "销量", "营收", "收入", "收益",
+    "销售", "销售额", "销量", "营收", "收入", "收益", "毛利", "毛利率",
     "定价", "价格", "报销", "支付方", "医保", "保险",
     "商业化", "商业模式", "商业机会",
     "竞争", "竞品", "竞争对手", "竞争格局",
+    "融资", "估值", "领投", "跟投",
     "CAGR", "增长率"
 ]
 
@@ -414,6 +536,7 @@ def _infer_dims_from_text(text: str) -> List[str]:
         "目标", "总体目标", "阶段性目标", "里程碑", "阶段性里程碑",
         "计划", "任务", "工作包", "kpi", "终点", "主要终点", "次要终点",
         "本项目旨在", "本项目将", "本项目计划", "预期达到", "希望实现",
+        "营收目标", "收入目标", "GMV", "估值目标", "融资目标", "市占目标",
     ]
     obj_keywords_en = [
         "aim", "aims to", "aimed to",
@@ -429,6 +552,7 @@ def _infer_dims_from_text(text: str) -> List[str]:
         "策略", "路径", "路线", "方案", "技术路线", "实施方案",
         "商业模式", "市场进入", "商业化", "推广策略",
         "合作模式", "运营模式", "联合开发", "授权引进",
+        "供应链", "渠道", "经销商", "分销", "SaaS", "订阅",
         "市场", "市场规模", "市场需求", "市场前景", "市场潜力",
         "市场份额", "竞争格局", "竞品", "竞争对手"
     ]
@@ -644,6 +768,8 @@ def run_extract(proposal_id: str, max_chars: int = 1800, overlap: int = 400):
     out_path = out_dir / "raw_facts.jsonl"
 
     total_facts = 0
+    dup_skipped = 0
+    seen_fact_keys: set = set()
     # 统计每个维度的 fact 数量，便于 sanity check
     dim_counts = {dim: 0 for dim in VALID_DIMENSIONS}
 
@@ -701,6 +827,13 @@ def run_extract(proposal_id: str, max_chars: int = 1800, overlap: int = 400):
                     normalized_list.append(norm)
 
             for fact in normalized_list:
+                dkey = _fact_dedup_key(fact.get("text", ""))
+                if not dkey:
+                    continue
+                if dkey in seen_fact_keys:
+                    dup_skipped += 1
+                    continue
+                seen_fact_keys.add(dkey)
                 f_out.write(json.dumps(fact, ensure_ascii=False) + "\n")
                 total_facts += 1
                 # 更新维度计数
@@ -715,6 +848,8 @@ def run_extract(proposal_id: str, max_chars: int = 1800, overlap: int = 400):
             _write_progress(idx + 1, len(chunks), proposal_id)
 
     print(f"\n[OK] 已写出事实文件: {out_path} (总事实数={total_facts})")
+    if dup_skipped:
+        print(f"[INFO] 因与先前 chunk 文本重复而跳过的事实条数: {dup_skipped}")
 
     # ===== 全局维度分布检查 =====
     print("\n[SUMMARY] 维度分布统计（基于 raw_facts.jsonl）：")

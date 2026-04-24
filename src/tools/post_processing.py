@@ -12,6 +12,9 @@ post_processing.py · Structured Candidate Post-Processing (v3.2 · no-web-hard-
   - src/data/refined_answers/<pid>/postproc/final_payload.json
   - src/data/refined_answers/<pid>/postproc/report.md
   - src/data/refined_answers/<pid>/postproc/drops_debug.json
+
+若存在 src/data/questions/<pid>/generated_questions_detail.json（与 generate_questions 审核产物一致），
+可按题面启发式 grounding 标签对选中候选的 score.final 做温和加权，参与维度均值与综合分（见 question_grounding_weight）。
 """
 
 import os
@@ -23,8 +26,11 @@ import argparse
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict, Counter
+from typing import Any, Dict, Optional, Tuple
 from functools import lru_cache
 import re as _re
+
+from src.tools.postproc_lexicon import load_postproc_lexicon
 
 # ============================ 路径与默认 ============================
 
@@ -44,78 +50,7 @@ def _write_progress(done: int, total: int, pid: str = "") -> None:
 CONF_DIR = DATA_DIR / "config" / "postproc"
 QS_CONF_PATH = DATA_DIR / "config" / "question_sets" / "generated_questions.json"
 
-# —— 与 answering 对齐的权威词表（多辖区/标准） ——
-# ⚠️ 已移除 "hc"，避免把普通文本误计为 Health Canada；保留 "health canada"
-AUTHORITY_TOKENS = [
-    "fda","ema","ich q8","ich q9","ich q10","21 cfr part 11",
-    "iso 13485","iso 14971","iso 27001","who","gamp5","gamp 5", "pic/s",
-    "clinicaltrials.gov","eudract","nct","doi","orcid","pubmed","scopus",
-    "uspto","epo","cnipa",
-    # 多辖区/缩写
-    "nmpa","cfda","mhra","pmda","tga","health canada","nice",
-    "eudralex","mdr","ivdr",
-    "iec 62304","iec 62366","iso 62304","iso 62366",
-    "gcp","gmp","glp","gxp",
-    # 隐私/安全/合规
-    "gdpr","hipaa","phipa","pipeda","nist","soc 2","iso 27017","iso 27018"
-]
-
-COVERAGE_BANK = {
-    "regulatory": ["fda","ema","ich","21 cfr","iso","pic/s","gmp","gcp","glp","gxp",
-                   "nmpa","mhra","pmda","tga","health canada","mdr","ivdr",
-                   "gdpr","pipeda","phipa","hipaa","nist","soc 2","iso 27017","iso 27018"],
-    "trial": ["clinicaltrials.gov","eudract","nct"],
-    "publication": ["pubmed","scopus","doi","orcid"],
-    "patent": ["uspto","epo","cnipa","wo"],
-    "repo": ["github","gitlab","model card","data card"]
-}
-
-# === BEGIN PATCH · alias + tokenizer ===
-# 压缩串 → 标准空格写法（用于 21CFRPart11 / ISO13485 / ICHQ10 等）
-ALIAS_MAP = {
-    # 法规/标准归一
-    "21cfrpart11": "21 cfr part 11",
-    "21cfr11": "21 cfr part 11",
-    "iso13485": "iso 13485",
-    "iso14971": "iso 14971",
-    "iso27001": "iso 27001",
-    "iso27017": "iso 27017",
-    "iso27018": "iso 27018",
-    "iec62304": "iec 62304",
-    "iec62366": "iec 62366",
-    "gamp5": "gamp 5",
-    "ichq8": "ich q8",
-    "ichq9": "ich q9",
-    "ichq10": "ich q10",
-    "pics": "pic/s",
-
-    # 站点/域名归一
-    "clinicaltrialsgov": "clinicaltrials gov",
-}
-
-# 对齐加权：权威 token 给更高权重
-AUTHORITY_KEYWORDS = {
-    "fda": 2.0, "ema": 2.0, "ich": 2.0, "q8": 1.4, "q9": 1.4, "q10": 1.6,
-    "iso": 2.0, "13485": 2.0, "14971": 2.0, "27001": 1.6, "27017": 1.4, "27018": 1.4,
-    "21": 1.1, "cfr": 2.0, "part": 1.1, "11": 1.1,
-    "clinicaltrials": 2.0, "gov": 1.0, "eudract": 2.0,
-    "pubmed": 2.0, "scopus": 2.0, "orcid": 1.5,
-    "uspto": 2.0, "epo": 2.0, "cnipa": 2.0,
-    "gdpr": 2.0, "hipaa": 2.0, "phipa": 2.0, "pipeda": 2.0,
-    "gxp": 1.4, "gmp": 1.4, "glp": 1.4, "gcp": 1.4, "doi": 1.4,
-}
-
-# ==== 中文高权词（权重可按需微调）====
-AUTHORITY_KEYWORDS_ZH = {
-    "国家药监局": 2.0, "药监局": 1.8, "药监": 1.6, "nmpa": 2.0,
-    "注册": 1.6, "临床": 1.6, "注册号": 1.6, "备案": 1.2,
-    "发表": 1.4, "论文": 1.6, "期刊": 1.4, "doi": 1.6, "pubmed": 2.0,
-    "专利": 1.8, "发明专利": 2.0, "uspto": 2.0, "epo": 2.0, "cnipa": 2.0,
-    "合规": 1.6, "隐私": 1.4, "安全": 1.4, "gxp": 1.4, "gmp": 1.4, "gcp": 1.4, "glp": 1.4,
-    "上市": 1.6, "量产": 1.4, "认证": 1.4, "iso": 2.0, "iec": 1.6,
-    "药品审评中心": 1.8, "cde": 1.6, "卫健委": 1.4, "nhc": 1.4,
-    "注册证": 1.6, "批准文号": 1.6, "临床试验登记": 1.6
-}
+# 权威/覆盖/别名表由 YAML profile 提供（src/config/postproc_authority/），经 load_config 写入 cfg["_postproc_lexicon"]。
 
 STOPWORDS_ALIGN = {
     "the","and","of","to","for","in","on","by","with","a","an","is","are",
@@ -124,17 +59,18 @@ STOPWORDS_ALIGN = {
 
 _RE_NON_ALNUM = _re.compile(r"[^a-z0-9]+", _re.IGNORECASE)
 
-def _apply_aliases(s: str) -> str:
-    """统一空格/点号，做数字↔字母断词，并用 ALIAS_MAP 展开压缩串。"""
+def _apply_aliases(s: str, alias_map: Optional[Dict[str, str]] = None) -> str:
+    """统一空格/点号，做数字↔字母断词，并用 alias_map 展开压缩串。"""
     if not s:
         return ""
+    am = alias_map or {}
     base = str(s).lower()
     base = base.replace("\u00a0", " ").replace("\u3000", " ")
 
     # 先生成去标点“紧凑串”做 alias 命中
     compact = _RE_NON_ALNUM.sub("", base)
-    if compact in ALIAS_MAP:
-        base = ALIAS_MAP[compact]
+    if compact in am:
+        base = am[compact]
 
     # 数字-字母边界插空格：21CFRPart11 -> 21 CFR Part 11
     base = _re.sub(r"([a-z])([0-9])", r"\1 \2", base)
@@ -146,11 +82,11 @@ def _apply_aliases(s: str) -> str:
     base = base.replace("clinicaltrials.gov", "clinicaltrials gov")
     return base
 
-def _tokens_for_alignment(s: str):
+def _tokens_for_alignment(s: str, alias_map: Optional[Dict[str, str]] = None):
     r"""切出 [a-z]+ / \d+ / 中文块 词元，并构造 bigrams。"""
     if not s:
         return set(), set()
-    s = _apply_aliases(s)
+    s = _apply_aliases(s, alias_map)
 
     # 保留原有：把非字母数字替换为空格（英文/数字通道）
     s_en = _RE_NON_ALNUM.sub(" ", s)
@@ -171,22 +107,27 @@ def _tokens_for_alignment(s: str):
     return unigrams, bigrams
 
 
-def _qa_alignment_ratio(question: str, answer: str) -> float:
+def _qa_alignment_ratio(question: str, answer: str, lex: Dict[str, Any]) -> float:
     """题干与答案正文之间的带权重 token 重合度（中英），不注入题干到 corpus，避免循环虚高。"""
     if not (question or "").strip() or not (answer or "").strip():
         return 0.0
-    q_uni, q_bi = _tokens_for_alignment(question)
+    am = lex.get("alias_map") or {}
+    kw_en = lex.get("authority_keywords") or {}
+    kw_zh = lex.get("authority_keywords_zh") or {}
+    q_uni, q_bi = _tokens_for_alignment(question, am)
     if not q_uni:
         return 0.0
-    a_uni, a_bi = _tokens_for_alignment(sanitize_for_scoring(answer))
+    a_uni, a_bi = _tokens_for_alignment(sanitize_for_scoring(answer), am)
     if not a_uni:
         return 0.0
-    return _weighted_overlap(q_uni, q_bi, a_uni, a_bi)
+    return _weighted_overlap(q_uni, q_bi, a_uni, a_bi, kw_en, kw_zh)
 
 
-def _blend_hint_and_qa(hint_score: float, question: str, answer: str, valid_hints: int) -> float:
+def _blend_hint_and_qa(
+    hint_score: float, question: str, answer: str, valid_hints: int, lex: Dict[str, Any]
+) -> float:
     """当检索 hints 与正文语言/体裁不一致时，用问答贴合度抬升对齐信号。"""
-    qa = _qa_alignment_ratio(question or "", answer or "")
+    qa = _qa_alignment_ratio(question or "", answer or "", lex)
     if qa <= 0.05:
         return max(0.0, min(1.0, hint_score))
     # hints 越多且偏「检索词」，问答重合权重略提高
@@ -194,17 +135,23 @@ def _blend_hint_and_qa(hint_score: float, question: str, answer: str, valid_hint
     return max(0.0, min(1.0, (1.0 - w_qa) * hint_score + w_qa * qa))
 
 
-def _weighted_overlap(q_uni, q_bi, c_uni, c_bi):
+def _weighted_overlap(
+    q_uni,
+    q_bi,
+    c_uni,
+    c_bi,
+    kw_en: Dict[str, float],
+    kw_zh: Dict[str, float],
+):
     """基于问题/提示 tokens 与候选 tokens 的带权重重合度，bigrams 轻度加成。"""
     if not q_uni:
         return 0.0
 
     def w(t):
-        # 既支持英文权重，也支持中文高权词
-        if t in AUTHORITY_KEYWORDS:
-            return AUTHORITY_KEYWORDS[t]
-        if t in AUTHORITY_KEYWORDS_ZH:
-            return AUTHORITY_KEYWORDS_ZH[t]
+        if t in kw_en:
+            return kw_en[t]
+        if t in kw_zh:
+            return kw_zh[t]
         return 1.0
 
     den = sum(w(t) for t in q_uni)
@@ -247,6 +194,11 @@ DEFAULT_CONF = {
         "innovation": 1.10,
         "feasibility": 1.20
     },
+
+    # ========= 权威词表 profile（src/config/postproc_authority/<name>.yaml）=========
+    # default | regulated_products；见 src/config/postproc_authority/*.yaml
+    # 可被 postproc/config.json 覆盖；亦可用 POSTPROC_AUTHORITY_PROFILE，或 REVIEW_DOMAIN（biomedical→regulated）。
+    "authority_profile": "default",
 
     # ========= 扣分项 =========
     # 👉 所有 penalty 稍微变“软”一点，避免把分数全往 0.4 附近压扁
@@ -312,12 +264,29 @@ DEFAULT_CONF = {
     # ========= 输出校准（仿射映射到更可读区间；保留 *_raw 供审计）=========
     # 典型案卷在「无检索 + 中英混杂」场景下 raw 分常被压在 0.42–0.52；
     # 对 raw≥apply_above 的维度/综合分做温和抬升，使「完整材料」更易落在 0.70+（约 7/10）。
+    # apply_above 略降：让 0.12–0.14 区间的「有内容但偏低」案卷也进入校准，避免卡在展示扁带；
+    # scale/offset 微调：在 tests 约束下略抬高中高分展示（raw 与 verdict 逻辑不变）。
     "output_calibration": {
         "enabled": True,
-        "apply_above": 0.14,
-        "score": {"scale": 1.22, "offset": 0.188},
-        "confidence": {"scale": 1.12, "offset": 0.168}
-    }
+        "apply_above": 0.12,
+        "score": {"scale": 1.24, "offset": 0.195},
+        "confidence": {"scale": 1.14, "offset": 0.175}
+    },
+
+    # ========= 问题 grounding 加权（读 questions/<pid>/generated_questions_detail.json）=========
+    # 在候选打分完成后，仅缩放 score.final（及 after_topic_conflict 展示一致），不改动 α/β 子项。
+    "question_grounding_weight": {
+        "enabled": True,
+        "default_unmatched_multiplier": 1.0,
+        "multiplier_bounds": [0.70, 1.12],
+        "by_label": {
+            "grounded": 1.05,
+            "weak": 1.0,
+            "ungrounded": 0.94,
+            "no_source_text": 0.98,
+            "unknown": 1.0,
+        },
+    },
 }
 
 PUNC = set(string.punctuation + "，。；：！？、（）【】《》…—-·")
@@ -420,13 +389,15 @@ def _placeholder_ratio(cleaned_text: str) -> float:
 
 def load_config():
     cfg_path = CONF_DIR / "config.json"
+    user_cfg = {}
     if cfg_path.exists():
         try:
             user_cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-            return _merge_conf(DEFAULT_CONF, user_cfg)
         except Exception:
-            pass
-    return DEFAULT_CONF
+            user_cfg = {}
+    cfg = _merge_conf(DEFAULT_CONF, user_cfg)
+    cfg["_postproc_lexicon"] = load_postproc_lexicon(cfg)
+    return cfg
 
 def _merge_conf(base, user):
     out = dict(base)
@@ -456,6 +427,112 @@ def read_json(p: Path):
 def write_json(p: Path, obj):
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _norm_question_key(s: str) -> str:
+    s = (s or "").strip()
+    return re.sub(r"\s+", " ", s)
+
+
+def build_grounding_maps_from_detail(detail: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """从 generate_questions 的 detail JSON 建立 (维度, q_index) 与题干归一化文本索引。"""
+    if not isinstance(detail, dict):
+        return None
+    by_pos: Dict[Tuple[str, int], Dict[str, Any]] = {}
+    by_text: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    dims = detail.get("dimensions")
+    if not isinstance(dims, dict):
+        return None
+    for dim_raw, block in dims.items():
+        dim = (dim_raw or "").strip().lower()
+        if not dim or not isinstance(block, dict):
+            continue
+        qs = block.get("questions")
+        if not isinstance(qs, list):
+            continue
+        for i, q in enumerate(qs, start=1):
+            if not isinstance(q, dict):
+                continue
+            audit = q.get("audit") or {}
+            g = audit.get("grounding") or {}
+            lab = str(g.get("label") or "unknown").strip() or "unknown"
+            entry: Dict[str, Any] = {
+                "label": lab,
+                "score": g.get("score"),
+                "matched_terms": g.get("matched_terms"),
+                "term_total": g.get("term_total"),
+            }
+            by_pos[(dim, i)] = entry
+            zh = _norm_question_key(str(q.get("question_zh") or ""))
+            if zh:
+                by_text[(dim, zh)] = entry
+    if not by_pos and not by_text:
+        return None
+    return {"by_pos": by_pos, "by_text": by_text}
+
+
+def lookup_grounding_entry(
+    maps: Optional[Dict[str, Any]],
+    dim: str,
+    q_index: Any,
+    question_text: str,
+) -> Optional[Dict[str, Any]]:
+    if not maps:
+        return None
+    dim_l = (dim or "").strip().lower()
+    bp = maps.get("by_pos") or {}
+    bt = maps.get("by_text") or {}
+    try:
+        qi = int(q_index)
+    except (TypeError, ValueError):
+        qi = -1
+    if qi >= 1:
+        hit = bp.get((dim_l, qi))
+        if hit:
+            return hit
+    qn = _norm_question_key(question_text)
+    if qn:
+        hit2 = bt.get((dim_l, qn))
+        if hit2:
+            return hit2
+    return None
+
+
+def grounding_multiplier_for_entry(entry: Optional[Dict[str, Any]], block: Dict[str, Any]) -> float:
+    if not block or not block.get("enabled", True):
+        return 1.0
+    if not entry:
+        try:
+            d = float(block.get("default_unmatched_multiplier", 1.0))
+        except (TypeError, ValueError):
+            d = 1.0
+        bounds = block.get("multiplier_bounds") or [0.70, 1.12]
+        lo, hi = float(bounds[0]), float(bounds[1])
+        return max(lo, min(hi, d))
+    label = str(entry.get("label") or "unknown").strip() or "unknown"
+    tbl = block.get("by_label") or {}
+    m = tbl.get(label)
+    if m is None:
+        m = tbl.get("unknown", 1.0)
+    try:
+        mf = float(m)
+    except (TypeError, ValueError):
+        mf = 1.0
+    bounds = block.get("multiplier_bounds") or [0.70, 1.12]
+    lo, hi = float(bounds[0]), float(bounds[1])
+    return max(lo, min(hi, mf))
+
+
+def load_question_grounding_maps(data_dir: Path, proposal_id: str) -> Optional[Dict[str, Any]]:
+    p = data_dir / "questions" / proposal_id / "generated_questions_detail.json"
+    if not p.is_file():
+        return None
+    try:
+        detail = read_json(p)
+    except Exception:
+        return None
+    return build_grounding_maps_from_detail(detail)
+
 
 def norm01(x, lo, hi):
     """
@@ -549,26 +626,32 @@ def bar(value: float, n: int = 20) -> str:
     k = max(0, min(n, int(round(float(value) * n))))
     return "█" * k + "░" * (n - k)
 
-def authority_ratio(hints: list) -> float:
+def authority_ratio(hints: list, lex: Dict[str, Any]) -> float:
     if not hints:
+        return 0.0
+    toks = lex.get("authority_tokens") or []
+    if not toks:
         return 0.0
     hits = 0
     for h in hints:
         s = (h or "").lower()
-        if any(tok in s for tok in AUTHORITY_TOKENS):
+        if any(tok in s for tok in toks):
             hits += 1
     return hits / max(1, len(hints))
 
-def coverage_score(hints: list) -> float:
+def coverage_score(hints: list, lex: Dict[str, Any]) -> float:
     if not hints:
+        return 0.0
+    bank = lex.get("coverage_bank") or {}
+    if not bank:
         return 0.0
     cats = set()
     for h in hints:
         s = (h or "").lower()
-        for cat, toks in COVERAGE_BANK.items():
+        for cat, toks in bank.items():
             if any(tok in s for tok in toks):
                 cats.add(cat)
-    return len(cats) / len(COVERAGE_BANK)
+    return len(cats) / max(1, len(bank))
 
 def has_redline(text: str) -> bool:
     t = text or ""
@@ -593,14 +676,16 @@ def _strip_cross_dim_tags(dim: str, tags: list) -> list:
         keep.append(s)
     return keep
 
-def _authority_hints_from_qs(qs_cfg: dict, dim: str, limit: int = 8) -> list:
+def _authority_hints_from_qs(qs_cfg: dict, dim: str, limit: int, lex: Dict[str, Any]) -> list:
     try:
         block = qs_cfg.get(dim, {}) or {}
         hints = block.get("search_hints", []) or []
         hints = _strip_cross_dim_tags(dim, hints)
+        toks = lex.get("authority_tokens") or []
+
         def score(h):
             s = str(h).lower()
-            return -sum(1 for t in AUTHORITY_TOKENS if t in s)
+            return -sum(1 for t in toks if t in s)
         hints = list({h: None for h in hints}.keys())
         hints.sort(key=score)
         return hints[:limit]
@@ -609,8 +694,16 @@ def _authority_hints_from_qs(qs_cfg: dict, dim: str, limit: int = 8) -> list:
 
 # ===== 语义化对齐（替换原先的字面包含比对） =====
 # === BEGIN PATCH · improved alignment ===
-def _alignment_ratio(dim: str, auth_hints: list, answer: str, topic_tags: list, evidence_hints: list,
-                     question: str = "", claims: list = None) -> float:
+def _alignment_ratio(
+    dim: str,
+    auth_hints: list,
+    answer: str,
+    topic_tags: list,
+    evidence_hints: list,
+    lex: Dict[str, Any],
+    question: str = "",
+    claims: list = None,
+) -> float:
     """
     语义对齐评分（支持中英）：把候选语料（answer + topic_tags + evidence_hints*2 [+ question] [+ claims]）
     与每条 auth_hint 做 token 对齐。
@@ -618,6 +711,9 @@ def _alignment_ratio(dim: str, auth_hints: list, answer: str, topic_tags: list, 
     - 若最终“有效切词的 hints 条数”为 0，则视为“无提示词场景”，给中性保底分。
     """
     claims = claims or []
+    am = lex.get("alias_map") or {}
+    kw_en = lex.get("authority_keywords") or {}
+    kw_zh = lex.get("authority_keywords_zh") or {}
     # 候选语料：把 evidence_hints 重复一次，提高权重；question/claims 可控注入
     pool = [
         sanitize_for_scoring(answer or ""),
@@ -631,23 +727,23 @@ def _alignment_ratio(dim: str, auth_hints: list, answer: str, topic_tags: list, 
         pool.append(" ".join([str(c) for c in claims if str(c).strip()]))
 
     corpus = " \n ".join(pool)
-    c_uni, c_bi = _tokens_for_alignment(corpus)
+    c_uni, c_bi = _tokens_for_alignment(corpus, am)
 
     # 无提示词：给一个中性保底，并可与问答贴合度混合
     if not auth_hints:
         base = 0.35 if c_uni else 0.0
-        return _blend_hint_and_qa(base, question or "", answer or "", 0)
+        return _blend_hint_and_qa(base, question or "", answer or "", 0, lex)
 
     cover_hits = 0
     scores = []
     valid_hints = 0  # 关键：仅统计切得出 token 的 hint
 
     for h in auth_hints:
-        q_uni, q_bi = _tokens_for_alignment(str(h))
+        q_uni, q_bi = _tokens_for_alignment(str(h), am)
         if not q_uni and not q_bi:
             continue
         valid_hints += 1
-        s = _weighted_overlap(q_uni, q_bi, c_uni, c_bi)
+        s = _weighted_overlap(q_uni, q_bi, c_uni, c_bi, kw_en, kw_zh)
         scores.append(s)
         if s >= 0.15:
             cover_hits += 1
@@ -655,7 +751,7 @@ def _alignment_ratio(dim: str, auth_hints: list, answer: str, topic_tags: list, 
     # 若所有 hints 切完都无有效 token，则当作“无 hint 场景”，给保底分
     if valid_hints == 0:
         base = 0.5 if c_uni else 0.0
-        return _blend_hint_and_qa(base, question or "", answer or "", 0)
+        return _blend_hint_and_qa(base, question or "", answer or "", 0, lex)
 
     if not scores:
         return 0.0
@@ -663,7 +759,7 @@ def _alignment_ratio(dim: str, auth_hints: list, answer: str, topic_tags: list, 
     coverage = cover_hits / max(1, valid_hints)
     mean_hit = sum(scores) / len(scores)
     hint_score = max(0.0, min(1.0, 0.5 * coverage + 0.5 * mean_hit))
-    return _blend_hint_and_qa(hint_score, question or "", answer or "", valid_hints)
+    return _blend_hint_and_qa(hint_score, question or "", answer or "", valid_hints, lex)
 # === END PATCH ===
 
 
@@ -681,20 +777,21 @@ def _dimension_drift_score(dim: str, answer: str, topic_tags: list, evidence_hin
 
 # =============== 证据短语 / 通识要点抽取（报告用） ===============
 
-def _top_evidence_phrases(hints: list, topk: int = 3):
+def _top_evidence_phrases(hints: list, topk: int, lex: Dict[str, Any]):
     if not hints:
         return []
     def _norm(h: str):
         s = re.sub(r"\s+", " ", (h or "")).strip()
         return s[:120]
     candidates = []
+    toks = lex.get("authority_tokens") or []
     for h in hints:
         s = _norm(str(h))
         if not s:
             continue
         score = 0
         low = s.lower()
-        for tok in AUTHORITY_TOKENS:
+        for tok in toks:
             if tok in low:
                 score += 1
         candidates.append((s, score))
@@ -732,7 +829,9 @@ def _uniq_general_insights(gi_list, topk: int = 10, max_len: int = 220):
 
 # ============================ 打分逻辑 ============================
 
-def _strong_alignment_bonus(ans: str, evids: list) -> float:
+def _strong_alignment_bonus(ans: str, evids: list, lex: Dict[str, Any]) -> float:
+    if not lex.get("strong_alignment_bonus"):
+        return 0.0
     if not ans and not evids:
         return 0.0
     text = (sanitize_for_scoring(ans) or "") + " " + " ".join([str(x) for x in (evids or [])])
@@ -748,7 +847,15 @@ def _strong_alignment_bonus(ans: str, evids: list) -> float:
         strong += 1
     return min(0.10, 0.03 * strong)
 
-def score_candidate(ans_item: dict, cfg: dict, peer_tokens_list=None, dim: str = "", auth_hints: list = None, question: str = "") -> dict:
+def score_candidate(
+    ans_item: dict,
+    cfg: dict,
+    peer_tokens_list=None,
+    dim: str = "",
+    auth_hints: list = None,
+    question: str = "",
+    lex: Optional[Dict[str, Any]] = None,
+) -> dict:
     ans = (ans_item.get("answer") or "").strip()
     claims = ans_item.get("claims") or []
     evids = ans_item.get("evidence_hints") or []
@@ -759,15 +866,23 @@ def score_candidate(ans_item: dict, cfg: dict, peer_tokens_list=None, dim: str =
     s_len   = norm01(len(sanitize_for_scoring(ans)), 0, cfg["length_ref_chars"])
     s_clm   = norm01(len([c for c in claims if isinstance(c, str) and c.strip()]), 0, cfg["claims_ref"])
     s_evc   = norm01(len([e for e in evids if isinstance(e, str) and e.strip()]), 0, cfg["evidence_ref"])
-    s_eva   = authority_ratio(evids)
-    s_evg   = coverage_score(evids)
+    lx = lex or (cfg.get("_postproc_lexicon") or {})
+    s_eva   = authority_ratio(evids, lx)
+    s_evg   = coverage_score(evids, lx)
     s_str   = looks_structured(ans)
 
     # —— 对齐（计分阶段只注入 claims，不注入 question；可通过 A/B 关闭 claims 注入）——
     use_qc = not cfg.get("_ablate_no_question_claims", False)
-    s_aln   = _alignment_ratio(dim, auth_hints or [], ans, tags, evids,
-                               question=(question if use_qc else ""),
-                               claims=(claims if use_qc else []))
+    s_aln   = _alignment_ratio(
+        dim,
+        auth_hints or [],
+        ans,
+        tags,
+        evids,
+        lx,
+        question=(question if use_qc else ""),
+        claims=(claims if use_qc else []),
+    )
 
     s_cal   = conf
 
@@ -777,7 +892,7 @@ def score_candidate(ans_item: dict, cfg: dict, peer_tokens_list=None, dim: str =
     s_eva = max(s_eva, auth_boost)
     s_evg = max(s_evg, cov_boost)
 
-    s_aln = min(1.0, s_aln + _strong_alignment_bonus(ans, evids))
+    s_aln = min(1.0, s_aln + _strong_alignment_bonus(ans, evids, lx))
 
     if peer_tokens_list:
         me = list(_tokenize_cached(sanitize_for_scoring(ans)))
@@ -845,7 +960,9 @@ def score_candidate(ans_item: dict, cfg: dict, peer_tokens_list=None, dim: str =
     }
 
 # —— 更强坏候选过滤：返回 (bool_bad, reason)
-def _bad_candidate_with_reason(c: dict, cfg: dict, dim_name: str, auth_hints: list, q_text: str = ""):
+def _bad_candidate_with_reason(
+    c: dict, cfg: dict, dim_name: str, auth_hints: list, q_text: str = "", lex: Optional[Dict[str, Any]] = None
+):
     ans_raw = (c.get("answer") or "").strip()
     ans = sanitize_for_scoring(ans_raw)
 
@@ -906,14 +1023,16 @@ def _bad_candidate_with_reason(c: dict, cfg: dict, dim_name: str, auth_hints: li
 
     # 8. 语义对齐检查：只用来丢弃严重跑题的 candidate，不再看 evidence/authority
     use_qc = not cfg.get("_ablate_no_question_claims", False)
+    lx = lex or (cfg.get("_postproc_lexicon") or {})
     aln = _alignment_ratio(
         dim_name,
         auth_hints or [],
         ans_raw,
         c.get("topic_tags") or [],
         c.get("evidence_hints") or [],
+        lx,
         question=(q_text if use_qc else ""),
-        claims=(c.get("claims") or [] if use_qc else [])
+        claims=(c.get("claims") or [] if use_qc else []),
     )
 
     dyn_min_align = float(min_align)
@@ -926,7 +1045,7 @@ def _bad_candidate_with_reason(c: dict, cfg: dict, dim_name: str, auth_hints: li
 
     return False, ""
 
-def _fallback_pick(cands: list, dim: str, auth_hints: list):
+def _fallback_pick(cands: list, dim: str, auth_hints: list, lex: Dict[str, Any]):
     def _alignment_ratio_local(answer: str, evids: list):
         # 仅作为兜底时的快速对齐（共性 token 命中）
         corpus = (sanitize_for_scoring(answer or "")) + " " + " ".join([str(h) for h in (evids or [])])
@@ -942,8 +1061,8 @@ def _fallback_pick(cands: list, dim: str, auth_hints: list):
         ans = (c.get("answer") or "")
         evids = c.get("evidence_hints") or []
         s_str = looks_structured(ans)
-        s_eva = authority_ratio(evids)
-        s_evg = coverage_score(evids)
+        s_eva = authority_ratio(evids, lex)
+        s_evg = coverage_score(evids, lex)
         s_evc = norm01(len([e for e in evids if str(e).strip()]), 0, 4)
         s_aln = _alignment_ratio_local(ans, evids)
         red_p = 0.0
@@ -982,21 +1101,33 @@ def _beta_with_sweetspot_and_provider(beta_raw: float, avg_jac: float, avg_ctr: 
     beta_final = max(0.0, min(1.0, beta_adj + delta))
     return beta_final
 
-def select_best_candidate(cands: list, cfg: dict, dim: str, auth_hints: list, q_text: str = "", last_provider: str = None):
+def select_best_candidate(
+    cands: list,
+    cfg: dict,
+    dim: str,
+    auth_hints: list,
+    q_text: str = "",
+    last_provider: str = None,
+    lex: Optional[Dict[str, Any]] = None,
+):
     if not cands:
         return {"best": None, "all": [], "pairwise": {"avg_jaccard": 0.0, "avg_contradiction": 0.0}, "drop_stats": {}}
+
+    lx = lex or cfg.get("_postproc_lexicon") or {}
 
     drop_stats = Counter()
     cleaned = []
     for c in cands:
-        bad, reason = _bad_candidate_with_reason(c, cfg, dim_name=dim, auth_hints=auth_hints, q_text=q_text)
+        bad, reason = _bad_candidate_with_reason(
+            c, cfg, dim_name=dim, auth_hints=auth_hints, q_text=q_text, lex=lx
+        )
         if bad:
             drop_stats[reason] += 1
         else:
             cleaned.append(c)
 
     if not cleaned:
-        idx = _fallback_pick(cands, dim, auth_hints)
+        idx = _fallback_pick(cands, dim, auth_hints, lx)
         cleaned = [cands[idx]]
 
     cands = cleaned
@@ -1023,7 +1154,9 @@ def select_best_candidate(cands: list, cfg: dict, dim: str, auth_hints: list, q_
     scored = []
     for idx, c in enumerate(cands):
         peer = [tokens[k] if k != idx else None for k in range(len(cands))]
-        sc = score_candidate(c, cfg, peer_tokens_list=peer, dim=dim, auth_hints=auth_hints, question=q_text)
+        sc = score_candidate(
+            c, cfg, peer_tokens_list=peer, dim=dim, auth_hints=auth_hints, question=q_text, lex=lx
+        )
         pv = _provider_name(c)
         beta = _beta_with_sweetspot_and_provider(beta_raw, avg_jac, avg_ctr, cfg, provider=pv)
         final = max(0.0, min(1.0, sc.get("alpha", sc.get("total", 0.0)) * beta))
@@ -1127,15 +1260,22 @@ def _apply_output_calibration_scalar(x: float, kind: str, cfg: dict) -> float:
 
 # ============================ 聚合与报告 ============================
 
-def aggregate_dimensions(items: list, cfg: dict, qs_cfg: dict):
+def aggregate_dimensions(
+    items: list,
+    cfg: dict,
+    qs_cfg: dict,
+    grounding_maps: Optional[Dict[str, Any]] = None,
+):
     per_question = []
+
+    lex: Dict[str, Any] = cfg.get("_postproc_lexicon") or load_postproc_lexicon(cfg)
 
     dim_bucket = defaultdict(list)
     dropped_reason_bucket = defaultdict(Counter)
     # —— 用于 provider 近分轮换 ——
     last_provider_per_dim = {d: None for d in DIM_ORDER + ["unknown"]}
 
-    auth_map = {dim: _authority_hints_from_qs(qs_cfg, dim, limit=8) for dim in DIM_ORDER}
+    auth_map = {dim: _authority_hints_from_qs(qs_cfg, dim, 8, lex) for dim in DIM_ORDER}
     auth_map.setdefault("unknown", [])
 
     provider_stats = Counter()
@@ -1150,13 +1290,37 @@ def aggregate_dimensions(items: list, cfg: dict, qs_cfg: dict):
         cands = it.get("candidates") or []
 
         picked = select_best_candidate(
-            cands, cfg,
+            cands,
+            cfg,
             dim=dim,
             auth_hints=auth_map.get(dim, []),
             q_text=ques,
-            last_provider=last_provider_per_dim.get(dim)
+            last_provider=last_provider_per_dim.get(dim),
+            lex=lex,
         )
         best = picked["best"]
+
+        g_block = cfg.get("question_grounding_weight") or {}
+        g_entry = None
+        g_mult = 1.0
+        orig_final = None
+        if grounding_maps is not None and bool(g_block.get("enabled", True)):
+            g_entry = lookup_grounding_entry(grounding_maps, dim, qidx, ques)
+            g_mult = grounding_multiplier_for_entry(g_entry, g_block)
+        if best and isinstance(best.get("score"), dict):
+            try:
+                orig_final = float(best["score"].get("final", 0.0))
+            except (TypeError, ValueError):
+                orig_final = None
+            if g_mult != 1.0:
+                sc = dict(best["score"])
+                for k in ("final", "after_topic_conflict"):
+                    if k in sc:
+                        try:
+                            sc[k] = max(0.0, min(1.0, float(sc[k]) * g_mult))
+                        except (TypeError, ValueError):
+                            pass
+                best = {**best, "score": sc}
 
         # 记录本维度上一次选中的 provider，供下一题“近分轮换”微调
         if best and best.get("candidate"):
@@ -1193,6 +1357,13 @@ def aggregate_dimensions(items: list, cfg: dict, qs_cfg: dict):
                 "auth_hints_used": auth_map.get(dim, []),
                 "drop_stats": picked["drop_stats"],  # ← 新增
             }
+            if grounding_maps is not None and bool(g_block.get("enabled", True)):
+                best_item["question_grounding"] = {
+                    "label": (g_entry or {}).get("label"),
+                    "multiplier": g_mult,
+                    "matched": g_entry is not None,
+                    "final_before_grounding_weight": orig_final,
+                }
             per_question.append(best_item)
             dim_bucket[dim].append(best_item)
 
@@ -1201,7 +1372,7 @@ def aggregate_dimensions(items: list, cfg: dict, qs_cfg: dict):
             provider_alpha[pv].append(float(best["detail"].get("alpha", 0.0)))
             provider_final[pv].append(float(best["score"].get("final", 0.0)))
         else:
-            per_question.append({
+            bad_item = {
                 "dimension": dim, "q_index": qidx, "question": ques,
                 "selected": None,
                 "score": {"alpha": 0.0, "beta": 0.0, "final": 0.0,
@@ -1211,8 +1382,16 @@ def aggregate_dimensions(items: list, cfg: dict, qs_cfg: dict):
                 "pairwise": {"avg_jaccard": 0.0, "avg_contradiction": 0.0},
                 "all_candidates": [],
                 "auth_hints_used": auth_map.get(dim, []),
-                "drop_stats": picked["drop_stats"]  # ← 新增
-            })
+                "drop_stats": picked["drop_stats"],  # ← 新增
+            }
+            if grounding_maps is not None and bool(g_block.get("enabled", True)):
+                bad_item["question_grounding"] = {
+                    "label": (g_entry or {}).get("label"),
+                    "multiplier": g_mult,
+                    "matched": g_entry is not None,
+                    "final_before_grounding_weight": orig_final,
+                }
+            per_question.append(bad_item)
 
     per_dimension = {}
     dims_for_report = list(DIM_ORDER)
@@ -1275,8 +1454,8 @@ def aggregate_dimensions(items: list, cfg: dict, qs_cfg: dict):
         for q in qs:
             sel = q.get("selected")
             if sel:
-                eva = authority_ratio(sel.get("evidence_hints") or [])
-                evg = coverage_score(sel.get("evidence_hints") or [])
+                eva = authority_ratio(sel.get("evidence_hints") or [], lex)
+                evg = coverage_score(sel.get("evidence_hints") or [], lex)
                 aln = float(sel.get("alignment_ratio", 0.0))
                 drf = float(sel.get("dimension_drift", 0.0))
 
@@ -1320,7 +1499,7 @@ def aggregate_dimensions(items: list, cfg: dict, qs_cfg: dict):
                 risks.append(f"Q{q['q_index']}：无有效答案")
                 snippets.append(f"Q{q['q_index']}：（无）")
 
-        top_evid = _top_evidence_phrases(evid_pool, topk=3)
+        top_evid = _top_evidence_phrases(evid_pool, 3, lex)
         gi_agg = _uniq_general_insights(gi_pool, topk=10)
 
         per_dimension[dim] = {
@@ -1408,6 +1587,29 @@ def aggregate_dimensions(items: list, cfg: dict, qs_cfg: dict):
         else:
             dim_median_bullets[dim] = 0
 
+    g_qgw = cfg.get("question_grounding_weight") or {}
+    g_summary: Dict[str, Any] = {
+        "enabled": bool(grounding_maps is not None and bool(g_qgw.get("enabled", True))),
+        "detail_loaded": grounding_maps is not None,
+        "by_label": {},
+        "n_nonneutral_multiplier": 0,
+    }
+    if grounding_maps is not None and bool(g_qgw.get("enabled", True)):
+        glc: Counter = Counter()
+        nn = 0
+        for q in per_question:
+            qg = q.get("question_grounding") or {}
+            lab = qg.get("label")
+            if lab:
+                glc[str(lab)] += 1
+            try:
+                if abs(float(qg.get("multiplier", 1.0)) - 1.0) > 1e-6:
+                    nn += 1
+            except (TypeError, ValueError):
+                pass
+        g_summary["by_label"] = dict(glc)
+        g_summary["n_nonneutral_multiplier"] = nn
+
     overall = {
         "overall_score": overall_score,
         "overall_confidence": overall_confidence,
@@ -1420,7 +1622,9 @@ def aggregate_dimensions(items: list, cfg: dict, qs_cfg: dict):
         "provider_stats": provider_summary,
         "placeholder_ratio_global": placeholder_cnt / max(1, sum(drop_g.values())) if drop_g else 0.0,
         "few_bullets_ratio_global": few_bullets_cnt / max(1, sum(drop_g.values())) if drop_g else 0.0,
-        "dim_median_bullets": dim_median_bullets
+        "dim_median_bullets": dim_median_bullets,
+        "question_grounding": g_summary,
+        "authority_lexicon_profile": (lex or {}).get("profile_id"),
     }
 
     return per_question, per_dimension, overall
@@ -1456,6 +1660,18 @@ def build_report_md(pid: str, meta: dict, per_dim: dict, overall: dict, cfg: dic
         lines.append(f"- 候选被丢弃原因（全局Top）：{disp}")
     lines.append(f"- 估计 placeholder 噪声占比：{overall.get('placeholder_ratio_global', 0.0):.1%}")
     lines.append(f"- 估计 few_bullets 占比：{overall.get('few_bullets_ratio_global', 0.0):.1%}")
+
+    qg = overall.get("question_grounding") or {}
+    if qg.get("enabled") and qg.get("detail_loaded"):
+        parts = ", ".join(f"{k}:{v}" for k, v in sorted((qg.get("by_label") or {}).items()))
+        lines.append(
+            f"- 问题 grounding 加权（generated_questions_detail）：标签分布 {parts or '（无）'}；"
+            f"乘子≠1 的题数 {qg.get('n_nonneutral_multiplier', 0)}"
+        )
+
+    ap = overall.get("authority_lexicon_profile")
+    if ap:
+        lines.append(f"- 权威词表 profile：**{ap}**（见 src/config/postproc_authority/）")
 
     if "unknown" in per_dim and per_dim["unknown"]["n"] > 0:
         unk_n = per_dim["unknown"]["n"]
@@ -1552,15 +1768,6 @@ def main():
     cfg["_ablate_no_question_claims"] = bool(args.ablate_no_question_claims)
     cfg["_ablate_no_dyn_relax"] = bool(args.ablate_no_dyn_relax)
 
-    # 读取问题集（用于权威/题材 hints 对齐）
-    if QS_CONF_PATH.exists():
-        try:
-            qs_cfg = read_json(QS_CONF_PATH)
-        except Exception:
-            qs_cfg = {}
-    else:
-        qs_cfg = {}
-
     if args.input:
         refined_path = Path(args.input)
         if not refined_path.exists():
@@ -1573,6 +1780,17 @@ def main():
         refined_path = REFINED_ROOT / pid / "all_refined_items.json"
         if not refined_path.exists():
             raise FileNotFoundError(f"未找到文件：{refined_path}")
+
+    qs_path = DATA_DIR / "questions" / pid / "generated_questions.json"
+    if not qs_path.exists():
+        qs_path = QS_CONF_PATH
+    if qs_path.exists():
+        try:
+            qs_cfg = read_json(qs_path)
+        except Exception:
+            qs_cfg = {}
+    else:
+        qs_cfg = {}
 
     data = read_json(refined_path)
     meta = (data.get("meta") or {})
@@ -1593,7 +1811,10 @@ def main():
     if bad:
         raise ValueError(f"输入 items 中存在缺失必要字段的条目：索引 {bad[:10]} ...，请检查 llm_answering 输出结构。")
 
-    per_question, per_dimension, overall = aggregate_dimensions(items, cfg, qs_cfg)
+    grounding_maps = load_question_grounding_maps(DATA_DIR, pid)
+    per_question, per_dimension, overall = aggregate_dimensions(
+        items, cfg, qs_cfg, grounding_maps
+    )
 
     out_dir = REFINED_ROOT / pid / "postproc"
     out_dir.mkdir(parents=True, exist_ok=True)

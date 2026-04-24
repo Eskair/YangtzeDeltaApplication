@@ -3,7 +3,7 @@
 llm_answering.py · Proposal-aware LLM Answering (ChatGPT + DeepSeek, no web search)
 
 新版职责：
-- 基于「维度抽取管线」生成的提案事实（dimensions_from_facts）+ 生成的问题集，
+- 基于「维度抽取管线」生成的维度摘要（dimensions_v2）+ 可选原文检索摘录 + 生成的问题集，
   为每个维度的问题生成“强关联该提案”的结构化回答。
 - 不再依赖外部 Web 检索；只使用：
     • 提案维度事实（summary/key_points/risks/mitigations/numbers 等）
@@ -18,6 +18,8 @@ llm_answering.py · Proposal-aware LLM Answering (ChatGPT + DeepSeek, no web sea
 - 这些通识部分必须写成“行业普遍情况/一般建议”，不能写成项目已经达成的事实；
 - 新增字段 general_insights：专门装“行业基准 / 常见坑 / 证据要求”这类专家经验层；
 - 修复 answer 分点格式问题，避免出现 “1. 1. xxx” 这种双重编号。
+- 多变体去重：dedup 键包含 variant_id + 全文指纹，避免 default/risk/implementation 仅因开头相似被并成一条，
+  以便 post_processing 中 β（候选间一致性）有区分度。
 """
 
 import os
@@ -26,6 +28,7 @@ import json
 import time
 import re
 import random
+import hashlib
 import argparse
 from pathlib import Path
 from datetime import datetime
@@ -36,6 +39,7 @@ from dotenv import load_dotenv
 # ========== 环境 & 路径 ==========
 load_dotenv()
 ROOT = Path(__file__).resolve().parents[1]  # .../src
+PROJECT_ROOT = ROOT.parent
 DATA_DIR = ROOT / "data"
 PROGRESS_FILE = DATA_DIR / "step_progress.json"
 
@@ -49,8 +53,14 @@ def _write_llm_progress(done: int, total: int, pid: str = "") -> None:
         pass
 EXTRACTED_DIR = DATA_DIR / "extracted"
 PARSED_DIR = DATA_DIR / "parsed"
+QUESTIONS_DIR = DATA_DIR / "questions"
 CONFIG_QS_DEFAULT = DATA_DIR / "config" / "question_sets" / "generated_questions.json"
 OUT_REFINED = DATA_DIR / "refined_answers"
+
+
+def default_qs_path_for_pid(pid: str) -> Path:
+    """Canonical question set from generate_questions (per proposal)."""
+    return QUESTIONS_DIR / pid / "generated_questions.json"
 
 
 def _init_answering_dim_order():
@@ -194,6 +204,42 @@ def load_dimension_context(pid: str, dim_file: Optional[Path]) -> Dict[str, str]
     return ctx
 
 
+def _compose_context_with_snippets(
+    pid: str,
+    dim: str,
+    dim_ctx: str,
+    dim_file: Path,
+) -> str:
+    """
+    分层上下文：维度摘要（dimensions_v2）+ 从 prepared 全文检索的原文摘录（Top-K，非全文）。
+    """
+    try:
+        raw = read_json(dim_file)
+        if isinstance(raw, dict) and "dimensions" in raw and isinstance(raw["dimensions"], dict):
+            root = raw["dimensions"]
+        else:
+            root = raw if isinstance(raw, dict) else {}
+        block = root.get(dim) or {}
+    except Exception:
+        block = {}
+
+    rq = _build_dim_context_text(dim, block)
+    kpc = len(
+        _flatten_list_field(block, ["key_points", "keypoints", "key_facts", "bullets"], limit=24)
+    )
+    snip = ""
+    try:
+        from src.tools.review_text_snippets import format_snippets_for_prompt
+
+        snip = format_snippets_for_prompt(PROJECT_ROOT, pid, rq, kpc)
+    except Exception as e:
+        print(f"[WARN] 原文摘录构建失败（{dim}）: {e}")
+    base = (dim_ctx or "").strip()
+    if not (snip or "").strip():
+        return base
+    return base + "\n\n" + snip.strip()
+
+
 # ========== 问题集 & 监管提示 ==========
 def get_q_list(block: Any) -> List[str]:
     if isinstance(block, dict) and isinstance(block.get("questions"), list):
@@ -231,11 +277,11 @@ def _load_reg_hints(qs_cfg: Dict[str, Any], dim: str, limit: int = 8) -> List[st
 # ========== Prompt 相关 ==========
 SYSTEM_CN = (
     "你是一名严格的项目评审专家。"
-    "你的任务是：在完整阅读给定的【提案事实】之后，围绕问题进行“与该提案强相关”的专业分析。"
+    "你的任务是：在完整阅读给定的【评审材料】（维度摘要 + 可选的原文检索摘录，非全文）之后，围绕问题进行“与该提案强相关”的专业分析。"
     "原则："
-    "1）必须优先基于【提案事实】给出结论；"
+    "1）必须优先基于【评审材料】给出结论；摘录仅为辅助核对，不得以摘录之外的全文细节作肯定性断言；"
     "2）不得发明提案中未出现的新试验、新数据、新机构或具体数字；"
-    "3）当你在【提案事实】中找不到某一类信息时，只能说“当前材料中未看到关于 X 的具体说明”，"
+    "3）当你在【评审材料】中找不到某一类信息时，只能说“当前材料中未看到关于 X 的具体说明”，"
     "   并优先写成“已有 A/B，但在 C/D 方面细节不足”；严禁使用“完全没有分析”“未进行任何评估”"
     "   “未提供任何信息”等绝对化表述；"
     "4）可以使用行业通识解释这些事实的意义，但不得虚构具体注册号/临床编号/专利号/精确样本量等细节；"
@@ -250,7 +296,7 @@ def _schema_structured() -> str:
 {
   "answer": "分点形式的主回答（中文，条理清晰，含项目现状+问题+改进方向等）",
   "claims": ["关键可验证结论1","关键可验证结论2","..."],
-  "evidence_hints": ["哪条提案事实/段落支撑对应结论，或需进一步核查的线索"],
+  "evidence_hints": ["哪条评审材料/摘录表述支撑对应结论，或需进一步核查的线索"],
   "general_insights": ["行业基准/类似项目常见做法/常见坑与证据要求（通识，不代表本项目已完成；建议最后一条给出统一免责声明）"],
   "topic_tags": ["维度内的小主题/标签"],
   "confidence": 0.0,
@@ -265,7 +311,7 @@ def _variant_instructions(variant_id: str) -> str:
             "变体：risk（风险视角）——重点：\n"
             "- 优先识别不确定性、缺失信息、潜在合规或技术风险；\n"
             "- 对每个主要风险给出“风险来源 + 可能影响 + 建议补充材料”；\n"
-            "- 若提案事实中未覆盖关键环节，要显式指出“信息缺口”；\n"
+            "- 若评审材料中未覆盖关键环节，要显式指出“信息缺口”；\n"
             "- 在 general_insights 中，总结同类项目在该维度常见的风险模式、监管关注点和证据要求，"
             "  明确说明这些是行业通识，不代表本项目已经满足。\n"
         )
@@ -283,7 +329,7 @@ def _variant_instructions(variant_id: str) -> str:
         "- 既要指出做得好的地方，也要指出存在的不足或不确定性；\n"
         "- 至少包含：现状概括、优势点、主要问题、改进方向四类内容；\n"
         "- 在 answer 中，你需要显式区分：\n"
-        "  a) 基于【提案事实】得出的本项目现状与问题；\n"
+        "  a) 基于【评审材料】得出的本项目现状与问题；\n"
         "  b) 行业基准 / baseline 对比（同类项目通常达到什么水平、需要哪些能力/数据/里程碑）；\n"
         "  c) 同类项目常见的坑和证据要求/监管关注点；\n"
         "- 在 claims 中，优先写“提案已经说明了什么/在哪些方面信息仍然有限”，"
@@ -304,8 +350,8 @@ def build_single_prompt(
     return f"""
 维度：{dimension}
 
-[提案事实]（只能在这里面引用具体细节；如无相关信息请据实指出）：
-{proposal_context or "（该维度的提案事实为空，仅可做通识性分析）"}
+[评审材料]（维度摘要 + 原文检索摘录；只能在此范围内引用具体细节；如无相关信息请据实指出）：
+{proposal_context or "（该维度的评审材料为空，仅可做通识性分析）"}
 
 [可选监管/术语方向提示]（非必须引用，如与提案无关可忽略）：
 {reg_txt}
@@ -319,11 +365,11 @@ def build_single_prompt(
 - 语言：中文（专有名词可保留英文）；
 - 结构：answer 必须以 3–8 条分点给出，每条前加“1. 2. 3.” 等编号，每条尽量控制在一到两句话；
 - 内容结构建议（非强制格式，但需覆盖）：\n
-  1）先基于[提案事实]总结本项目在该维度的“现状 + 优势 + 主要问题”；\n
+  1）先基于[评审材料]总结本项目在该维度的“现状 + 优势 + 主要问题”；\n
   2）再用 1–3 条要点，对标“行业基准 / baseline”，说明同类项目通常在该维度需要达到什么水平（注意：这是行业通识，不代表本项目已达到）；\n
   3）再用 1–3 条要点，总结“同类项目常见的坑、证据要求、监管或临床关注点”；\n
-- 关联度：优先基于[提案事实]分析该项目的真实情况；对于[提案事实]中没有的信息，只能用“缺失/需补充”的方式描述，不得假设已经存在；\n
-- 若[提案事实]中已经给出某一方面的部分信息（例如有市场规模但缺少细分、有竞争方列表但缺少对位分析），"
+- 关联度：优先基于[评审材料]分析该项目的真实情况；对于[评审材料]中没有的信息，只能用“缺失/需补充”的方式描述，不得假设已经存在；\n
+- 若[评审材料]中已经给出某一方面的部分信息（例如有市场规模但缺少细分、有竞争方列表但缺少对位分析），"
 "  必须写成“已有……但在……方面仍缺乏具体细节”，不得笼统说“未提供市场分析/未进行竞争对手评估”；\n
 - 通识与事实的区分：凡是基于行业经验的内容，需要在句中用“通常/一般而言/在同类项目中”等词标识清楚，避免写成好像本项目已经完成这些工作；\n
 - general_insights 字段：请单独列出 3–8 条不依赖本项目具体事实的“行业基准/常见坑/证据要求”要点，这些内容应可用于评估任何类似项目，且必须表述为通识建议；最后一条建议写成类似 “以上为行业通识建议，不代表本项目已经达成相关要求。” 这样的统一免责声明；\n
@@ -344,13 +390,13 @@ def build_batch_prompt(
     reg_txt = "；".join(reg_hints) if reg_hints else "无特别提示"
     q_block = "\n".join([f"{i+1}. {q}" for i, q in enumerate(questions)])
     return f"""
-你将针对同一维度下的多道问题，基于同一份【提案事实】给出与该提案高度相关的回答。
+你将针对同一维度下的多道问题，基于同一份【评审材料】给出与该提案高度相关的回答。
 请严格以对象数组 JSON 返回结果，格式为：{{"answers":[<对象1>,<对象2>,...]}}，数组长度必须与题目数一致。
 
 维度：{dimension}
 
-[提案事实]（只能在这里面引用具体细节；如无相关信息请据实指出）：
-{proposal_context or "（该维度的提案事实为空，仅可做通识性分析）"}
+[评审材料]（维度摘要 + 原文检索摘录；只能在此范围内引用具体细节；如无相关信息请据实指出）：
+{proposal_context or "（该维度的评审材料为空，仅可做通识性分析）"}
 
 [可选监管/术语方向提示]（非必须引用，如与提案无关可忽略）：
 {reg_txt}
@@ -363,13 +409,13 @@ def build_batch_prompt(
 统一回答要求：
 - 每道题的 answer：3–8 条分点，每条前加数字编号；条数不足时宁可只写 3–4 条扎实要点，也不要凑模板口号；
 - 建议在 answer 中显式覆盖三类信息：\n
-  a) 仅基于[提案事实]得出的本项目现状/优势/问题；\n
+  a) 仅基于[评审材料]得出的本项目现状/优势/问题；\n
   b) 行业基准 / baseline 对比（同类项目通常需要的团队能力、数据规模、里程碑等——需标明是行业通识）；\n
   c) 同类项目在该维度常见的坑、证据要求、监管或临床关注点；\n
-- 每道题的 claims：2–6 条可以被事后核对的结论，优先基于[提案事实]；若信息不足，请将“信息缺口”本身写入 claims；
-- 每道题的 evidence_hints：指明“哪类提案事实/哪一段内容/哪类文档可以支撑这些结论”，避免写空泛模板；
+- 每道题的 claims：2–6 条可以被事后核对的结论，优先基于[评审材料]；若信息不足，请将“信息缺口”本身写入 claims；
+- 每道题的 evidence_hints：指明“哪类评审材料/摘录中的表述/哪类原文档可支撑这些结论”，避免写空泛模板；
 - 每道题的 general_insights：3–8 条不依赖本项目具体事实的“行业基准/常见坑/证据要求”要点，只能写成行业普遍情况/一般建议，不得暗示本项目已经达成；建议其中最后一条写成统一的免责声明，例如 “以上为行业通识建议，并不代表本项目已经满足相关条件。”；\n
-- 若[提案事实]中已经给出某一方面的部分信息（例如有市场规模、竞品列举、风险表等），"
+- 若[评审材料]中已经给出某一方面的部分信息（例如有市场规模、竞品列举、风险表等），"
 "  只能评价为“现有描述在……方面仍不够细化/缺乏定量对比”，不得一概写成“项目未提供市场需求分析/竞争对手评估”等绝对否定；\n
 - 不得发明提案中不存在的新实验/新数据/新机构/具体注册号；对未给出的信息，只能以“需补充/需确认”的方式表达；\n
 - 仅输出一个 JSON 对象，不得有额外文字或 Markdown 围栏。
@@ -381,17 +427,17 @@ def build_batch_prompt(
 def build_refine_prompt(candidate_obj: Dict[str, Any], proposal_context: str, dimension: str) -> str:
     original = json.dumps(candidate_obj, ensure_ascii=False, indent=2)
     return f"""
-请在不引入任何超出【提案事实】的新信息的前提下，对下面的结构化回答做一次快速自我复核：
+请在不引入任何超出【评审材料】的新信息的前提下，对下面的结构化回答做一次快速自我复核：
 - 删改过于武断或缺乏依据的强结论；
-- 若某条结论在【提案事实】中找不到依据，请改写为“需要补充的材料/信息”；
+- 若某条结论在【评审材料】中找不到依据，请改写为“需要补充的材料/信息”；
 - 优化 answer 的分点表达，让每条更具体、更可执行，但不要发明新试验/新数据；
 - 检查 general_insights：确保里面只包含“行业基准/类似项目常见做法/常见坑与证据要求”等通识内容，不得把本项目的具体事实写进 general_insights；\n
 - 保持 JSON 结构和字段名完全不变（包括 general_insights）。
 
 维度：{dimension}
 
-[提案事实]：
-{proposal_context or "（该维度的提案事实为空，仅可做轻度通识性修正）"}
+[评审材料]：
+{proposal_context or "（该维度的评审材料为空，仅可做轻度通识性修正）"}
 
 原候选：
 {original}
@@ -522,7 +568,7 @@ def init_openai():
     key = os.getenv("OPENAI_API_KEY", "").strip()
     if not key:
         return None, None
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+    model = os.getenv("OPENAI_MODEL", "gpt-5.2").strip()
     client = OpenAIClient(api_key=key)
     print(f"✅ 已加载 OpenAI 模型：{model}")
     return client, model
@@ -862,18 +908,27 @@ def _finalize_candidate(
     return base
 
 
-def _simhash_key(s: str) -> str:
-    s = re.sub(r"\s+", " ", (s or "").strip().lower())
-    return s[:256]
+def _answer_body_fingerprint(answer: str) -> str:
+    """归一空白+小写后的全文 SHA256 前缀，避免仅比较前 256 字误合并尾部不同的变体。"""
+    s = re.sub(r"\s+", " ", (answer or "").strip().lower())
+    if not s:
+        return ""
+    return hashlib.sha256(s.encode("utf-8", errors="ignore")).hexdigest()[:32]
 
 
 def dedup_nearby(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    去掉「同一变体」下完全重复的答案；不同 variant_id 互不合并，
+    以便同一题仍可对多条 OpenAI 变体做 pairwise 评分（β 有信息量）。
+    """
     seen = set()
     kept: List[Dict[str, Any]] = []
     for c in candidates:
-        key = _simhash_key(c.get("answer", ""))
-        if not key:
+        vid = str((c or {}).get("variant_id") or "").strip()
+        fp = _answer_body_fingerprint((c or {}).get("answer", ""))
+        if not fp:
             continue
+        key = (vid, fp)
         if key in seen:
             continue
         seen.add(key)
@@ -1280,8 +1335,9 @@ def parse_args():
     ap.add_argument(
         "--qs_file",
         type=str,
-        default=str(CONFIG_QS_DEFAULT),
-        help="问题集 JSON 路径（通常由 generate_questions.py 生成）",
+        default="",
+        help="问题集 JSON；不填则优先 data/questions/{proposal_id}/generated_questions.json，"
+        "不存在时回退 data/config/question_sets/generated_questions.json",
     )
     ap.add_argument(
         "--dim-file",
@@ -1327,7 +1383,22 @@ def main():
         print("⚠️ 未检测到 data/extracted 下的提案目录，将使用占位 pid=unknown。")
     print(f"🧩 proposal_id = {pid}")
 
-    qs_path = Path(args.qs_file)
+    qs_arg = (args.qs_file or "").strip()
+    if qs_arg:
+        qs_path = Path(qs_arg)
+    else:
+        primary = default_qs_path_for_pid(pid)
+        if primary.exists():
+            qs_path = primary
+        elif CONFIG_QS_DEFAULT.exists():
+            qs_path = CONFIG_QS_DEFAULT
+            print(f"⚠️ 未找到 {primary}，回退使用全局副本: {CONFIG_QS_DEFAULT}")
+        else:
+            raise FileNotFoundError(
+                "未找到问题集。请先运行 generate_questions.py，或显式传入 --qs_file。\n"
+                f"  已尝试: {primary}\n"
+                f"  已尝试: {CONFIG_QS_DEFAULT}"
+            )
     if not qs_path.exists():
         raise FileNotFoundError(f"未找到问题集：{qs_path}")
     qs_cfg = read_json(qs_path)
@@ -1351,6 +1422,10 @@ def main():
 
     print(f"📄 使用维度上下文文件：{dim_file}")
     dim_context_map = load_dimension_context(pid, dim_file)
+    dim_context_rich: Dict[str, str] = {
+        d: _compose_context_with_snippets(pid, d, dim_context_map.get(d, ""), dim_file)
+        for d in DIM_ORDER
+    }
 
     reg_hints_map: Dict[str, List[str]] = {}
     for dim in DIM_ORDER:
@@ -1371,7 +1446,7 @@ def main():
         _write_llm_progress(0, len(dims), pid)
         for i, dim in enumerate(dims):
             q_list = get_q_list(qs_cfg.get(dim, []))
-            ctx = dim_context_map.get(dim, "")
+            ctx = dim_context_rich.get(dim, "")
             reg_hints = reg_hints_map.get(dim, [])
             items = answer_dimension(
                 provider="openai",
@@ -1410,7 +1485,7 @@ def main():
         print("🧠 DeepSeek 答题中 ...")
         for dim in dims:
             q_list = get_q_list(qs_cfg.get(dim, []))
-            ctx = dim_context_map.get(dim, "")
+            ctx = dim_context_rich.get(dim, "")
             reg_hints = reg_hints_map.get(dim, [])
             items = answer_dimension(
                 provider="deepseek",

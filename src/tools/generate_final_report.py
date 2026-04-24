@@ -11,10 +11,8 @@
   2) 生成综合 Markdown 报告：
        - 顶部：项目综合评审报告（含生成时间与说明）
        - 0. 一页摘要（Executive Summary）：
-           · verdict + 一句话结论依据
-           · 综合评分、信心度 + 区间解释
-           · Top 3 优势 & Top 3 主要风险
-           · 关键补充材料建议
+           · 有 ai_expert_opinion.json：verdict、综合分/信心度、区间说明、Top 优势/风险、建议
+           · 无 json：占位说明（第 1 节仍来自 .md，第 2 节来自 final_payload）
        - 1. AI 专家总体评审（来自 ai_expert_opinion.md，自动降一级标题）
        - 2. 维度问答与打分依据（基于 final_payload）：
              · 按五个维度展示
@@ -173,14 +171,26 @@ def _fmt_float(v, ndigits=1, default="0.0"):
 def build_executive_summary(
     expert_json: dict,
     metrics: Optional[Dict[str, Any]] = None,
+    *,
+    metrics_json_loaded: bool = False,
+    pid: str = "",
 ) -> str:
     """
     基于 ai_expert_opinion.json 生成“0. 一页摘要（Executive Summary）”Markdown 文本。
     若传入 postproc/metrics.json 解析结果，可与 output_calibration 对齐并回显权威 raw 分。
-    如果 expert_json 为空，则返回空字符串，调用方自己判断是否插入。
+    metrics_json_loaded：由调用方根据磁盘上是否存在 postproc/metrics.json 传入；
+    若未加载该文件，摘要中会标明原始尺度读数来自 ai_expert_opinion.json，避免读者误以为一定来自 metrics。
+    若 expert_json 为空（未找到 ai_expert_opinion.json），返回极简占位节，避免报告缺「第 0 节」。
     """
     if not expert_json:
-        return ""
+        rel = f"`expert_reports/{pid}/ai_expert_opinion.json`" if pid else "`ai_expert_opinion.json`"
+        return (
+            "## 0. 一页摘要（Executive Summary）\n\n"
+            f"> **未找到** {rel}，无法生成结构化一页摘要。"
+            "请补跑 `ai_expert_opinion` 后再生成报告以恢复本节。\n\n"
+            "> **当前报告内容**：第 **1** 节来自 `ai_expert_opinion.md`；"
+            "第 **2** 节来自 `postproc/final_payload.json`。\n"
+        )
 
     overall = expert_json.get("overall_opinion", {}) or {}
     score = overall.get("overall_score_echo", 0.0)       # 0–1 区间
@@ -223,26 +233,57 @@ def build_executive_summary(
     except (TypeError, ValueError):
         rs, rc = score, conf
     mr = _overall_raw_from_metrics(metrics)
-    if mr is not None:
+    raw_aligns_metrics = mr is not None
+    if raw_aligns_metrics:
         rs, rc = mr[0], mr[1]
     calibrated_note = abs(rs - score) > 0.02 or abs(rc - conf) > 0.02
     scale_help = calibrated_note or _output_calibration_enabled(metrics)
     if calibrated_note:
         lines.append(f"- **综合评分**：{_fmt_float(score, 3)}（0–1 区间，输出校准后读数）")
         lines.append(f"- **信心度**：{_fmt_float(conf, 3)}（输出校准后读数）")
+        if raw_aligns_metrics:
+            raw_suffix = "（与 `postproc/metrics.json` 中 `overall_*_raw` 一致）。"
+        elif metrics_json_loaded:
+            raw_suffix = (
+                "（`metrics.json` 已加载但未包含 `overall_*_raw`，"
+                "与 `ai_expert_opinion.json` 回显字段一致）。"
+            )
+        else:
+            raw_suffix = (
+                "（本次未加载 `postproc/metrics.json`，"
+                "与 `ai_expert_opinion.json` 中 `overall_score_raw_echo` / `confidence_raw_echo` 一致）。"
+            )
         lines.append(
-            f"- **原始尺度**（verdict 判定依据，未做输出校准）：综合评分 {_fmt_float(rs, 3)}，信心度 {_fmt_float(rc, 3)}"
+            f"- **原始尺度**（verdict 判定依据，未做输出校准）："
+            f"综合评分 {_fmt_float(rs, 3)}，信心度 {_fmt_float(rc, 3)}{raw_suffix}"
         )
     else:
         lines.append(f"- **综合评分**：{_fmt_float(score, 3)}（0–1 区间）")
         lines.append(f"- **信心度**：{_fmt_float(conf, 3)}")
+        if not metrics_json_loaded:
+            lines.append(
+                "- _说明：未检测到 `postproc/metrics.json`；本节综合分与信心度"
+                " 均来自 `ai_expert_opinion.json`。若需与 postproc 逐字段对齐，请先生成 metrics。_"
+            )
     lines.append("")
     lines.append("> **评分区间说明（供非技术评审参考）**：")
     if scale_help:
+        if raw_aligns_metrics:
+            verdict_src = "**verdict** 仍以「原始尺度」一行为准（与 `metrics.json` 中 `overall_*_raw` 一致）。"
+        elif metrics_json_loaded:
+            verdict_src = (
+                "**verdict** 仍以「原始尺度」一行为准（数值与 `ai_expert_opinion.json` 一致；"
+                "建议在 metrics 补齐 `overall_*_raw` 后与本节对照）。"
+            )
+        else:
+            verdict_src = (
+                "**verdict** 仍以「原始尺度」一行为准（数值来自 `ai_expert_opinion.json`；"
+                "与 postproc 完全一致时请对照 `metrics.json`）。"
+            )
         lines.append(
             "> - 下列 **0.62 / 0.45** 阈值针对本页「综合评分」行中的 **0–1 读数**；"
             "若该行已标注为「输出校准后读数」，请按**校准后的分**对照区间。"
-            "**verdict** 仍以「原始尺度」一行为准（与 `metrics.json` 中 `overall_*_raw` 一致）。"
+            f"{verdict_src}"
         )
     lines.append("> - ≥ 0.62：整体条件较好，可在控制风险前提下推进；")
     lines.append("> - 0.45–0.62：信息不充分或优劣并存，建议补充材料后再决策；")
@@ -440,14 +481,15 @@ def main():
         raise FileNotFoundError(f"未找到 final_payload.json：{fp_path}")
     if not expert_md_path.exists():
         raise FileNotFoundError(f"未找到专家评审 Markdown：{expert_md_path}")
-    # ai_expert_opinion.json 缺失时不会报错，只是无法生成一页摘要
+    # ai_expert_opinion.json 缺失时不会报错；第 0 节为占位说明
     expert_json = {}
     if expert_json_path.exists():
         expert_json = load_json(expert_json_path)
 
     metrics: Dict[str, Any] = {}
     metrics_json_path = postproc_dir / "metrics.json"
-    if metrics_json_path.exists():
+    metrics_json_loaded = metrics_json_path.exists()
+    if metrics_json_loaded:
         metrics = load_json(metrics_json_path)
 
     REPORT_ROOT.mkdir(parents=True, exist_ok=True)
@@ -469,11 +511,15 @@ def main():
     report_lines.append("_本报告由 AI 辅助评审系统自动生成，供内部专家和决策委员会参考使用。_")
     report_lines.append("")
 
-    # 0. 一页摘要（如果有 ai_expert_opinion.json）
-    exec_summary_md = build_executive_summary(expert_json, metrics)
-    if exec_summary_md:
-        report_lines.append(exec_summary_md)
-        report_lines.append("")
+    # 0. 一页摘要（有 json 则为完整摘要；无 json 为占位，避免缺节）
+    exec_summary_md = build_executive_summary(
+        expert_json,
+        metrics,
+        metrics_json_loaded=metrics_json_loaded,
+        pid=pid,
+    )
+    report_lines.append(exec_summary_md)
+    report_lines.append("")
     _write_progress(1, 4, pid)
 
     # 1. AI 专家总体评审（来自 ai_expert_opinion.md）

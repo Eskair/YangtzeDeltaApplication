@@ -21,3 +21,4 @@ tavily-python
 duckduckgo-search
 pyyaml
 jinja2
+jieba

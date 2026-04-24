@@ -20,7 +20,7 @@ def get_llm_client():
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY 未配置")
         client = OpenAI(api_key=api_key)
-        model_name = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        model_name = os.getenv("OPENAI_MODEL", "gpt-5.2")
         print(f"✅ 已加载 OpenAI 模型：{model_name}")
         return {"client": client, "model_name": model_name, "provider": "openai"}
 

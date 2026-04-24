@@ -21,7 +21,7 @@ python -c "import fastapi" #If no error → everything is ready
 
 OPENAI_API_KEY=your_real_key
 PROVIDER=openai
-OPENAI_MODEL=gpt-4o-mini
+OPENAI_MODEL=gpt-5.2
 ENABLE_VISION=false
 
 👉 You already fixed UTF8 in server.py ✅

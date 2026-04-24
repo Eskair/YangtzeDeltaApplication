@@ -280,7 +280,7 @@ class LLMEvaluator:
             key = os.getenv("OPENAI_API_KEY", "").strip()
             if key:
                 self._client = OpenAI(api_key=key)
-                self._model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+                self._model = os.getenv("OPENAI_MODEL", "gpt-5.2")
         except ImportError:
             pass
 

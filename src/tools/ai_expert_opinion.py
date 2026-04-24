@@ -78,7 +78,7 @@ load_dotenv()
 PROVIDER = os.getenv("PROVIDER", "openai").strip().lower()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.2").strip()
 TIMEOUT_CONNECT = int(os.getenv("HTTP_TIMEOUT_CONNECT", "12"))
 TIMEOUT_READ = int(os.getenv("HTTP_TIMEOUT_READ", "60"))
 

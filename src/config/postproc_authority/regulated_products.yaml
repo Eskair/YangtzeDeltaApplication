@@ -1,0 +1,193 @@
+# 强监管 / 药械临床友好：与历史 post_processing 内置词表对齐；开启结构化对齐加分（试验登记号、DOI、专利号等）。
+id: regulated_products
+strong_alignment_bonus: true
+
+authority_tokens:
+  - fda
+  - ema
+  - ich q8
+  - ich q9
+  - ich q10
+  - 21 cfr part 11
+  - iso 13485
+  - iso 14971
+  - iso 27001
+  - who
+  - gamp5
+  - gamp 5
+  - pic/s
+  - clinicaltrials.gov
+  - eudract
+  - nct
+  - doi
+  - orcid
+  - pubmed
+  - scopus
+  - uspto
+  - epo
+  - cnipa
+  - nmpa
+  - cfda
+  - mhra
+  - pmda
+  - tga
+  - health canada
+  - nice
+  - eudralex
+  - mdr
+  - ivdr
+  - iec 62304
+  - iec 62366
+  - iso 62304
+  - iso 62366
+  - gcp
+  - gmp
+  - glp
+  - gxp
+  - gdpr
+  - hipaa
+  - pipeda
+  - phipa
+  - nist
+  - soc 2
+  - iso 27017
+  - iso 27018
+
+coverage_bank:
+  regulatory:
+    - fda
+    - ema
+    - ich
+    - 21 cfr
+    - iso
+    - pic/s
+    - gmp
+    - gcp
+    - glp
+    - gxp
+    - nmpa
+    - mhra
+    - pmda
+    - tga
+    - health canada
+    - mdr
+    - ivdr
+    - gdpr
+    - pipeda
+    - phipa
+    - hipaa
+    - nist
+    - soc 2
+    - iso 27017
+    - iso 27018
+  trial:
+    - clinicaltrials.gov
+    - eudract
+    - nct
+  publication:
+    - pubmed
+    - scopus
+    - doi
+    - orcid
+  patent:
+    - uspto
+    - epo
+    - cnipa
+    - wo
+  repo:
+    - github
+    - gitlab
+    - model card
+    - data card
+
+alias_map:
+  21cfrpart11: 21 cfr part 11
+  21cfr11: 21 cfr part 11
+  iso13485: iso 13485
+  iso14971: iso 14971
+  iso27001: iso 27001
+  iso27017: iso 27017
+  iso27018: iso 27018
+  iec62304: iec 62304
+  iec62366: iec 62366
+  gamp5: gamp 5
+  ichq8: ich q8
+  ichq9: ich q9
+  ichq10: ich q10
+  pics: pic/s
+  clinicaltrialsgov: clinicaltrials gov
+
+authority_keywords:
+  fda: 2.0
+  ema: 2.0
+  ich: 2.0
+  q8: 1.4
+  q9: 1.4
+  q10: 1.6
+  iso: 2.0
+  "13485": 2.0
+  "14971": 2.0
+  "27001": 1.6
+  "27017": 1.4
+  "27018": 1.4
+  "21": 1.1
+  cfr: 2.0
+  part: 1.1
+  "11": 1.1
+  clinicaltrials: 2.0
+  gov: 1.0
+  eudract: 2.0
+  pubmed: 2.0
+  scopus: 2.0
+  orcid: 1.5
+  uspto: 2.0
+  epo: 2.0
+  cnipa: 2.0
+  gdpr: 2.0
+  hipaa: 2.0
+  phipa: 2.0
+  pipeda: 2.0
+  gxp: 1.4
+  gmp: 1.4
+  glp: 1.4
+  gcp: 1.4
+  doi: 1.4
+
+authority_keywords_zh:
+  国家药监局: 2.0
+  药监局: 1.8
+  药监: 1.6
+  nmpa: 2.0
+  注册: 1.6
+  临床: 1.6
+  注册号: 1.6
+  备案: 1.2
+  发表: 1.4
+  论文: 1.6
+  期刊: 1.4
+  doi: 1.6
+  pubmed: 2.0
+  专利: 1.8
+  发明专利: 2.0
+  uspto: 2.0
+  epo: 2.0
+  cnipa: 2.0
+  合规: 1.6
+  隐私: 1.4
+  安全: 1.4
+  gxp: 1.4
+  gmp: 1.4
+  gcp: 1.4
+  glp: 1.4
+  上市: 1.6
+  量产: 1.4
+  认证: 1.4
+  iso: 2.0
+  iec: 1.6
+  药品审评中心: 1.8
+  cde: 1.6
+  卫健委: 1.4
+  nhc: 1.4
+  注册证: 1.6
+  批准文号: 1.6
+  临床试验登记: 1.6

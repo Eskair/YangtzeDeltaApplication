@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.config import get_config, clear_cache, DomainConfig
+from src.config import get_config, clear_cache, DomainConfig, material_domain_zh_for_prompts
 
 
 def test_default_config_loads():
@@ -86,6 +86,15 @@ def test_fallback_dimension():
     assert cfg.fallback_dimension == "feasibility"
 
 
+def test_material_domain_zh_nonempty():
+    clear_cache()
+    cfg = get_config("default")
+    assert isinstance(cfg.material_domain_zh, str)
+    assert len(cfg.material_domain_zh.strip()) >= 10
+    blob = material_domain_zh_for_prompts()
+    assert "商业" in blob or "融资" in blob
+
+
 def test_nonexistent_domain_falls_back():
     clear_cache()
     cfg = get_config("nonexistent_domain_xyz")
@@ -104,6 +113,7 @@ if __name__ == "__main__":
         test_get_dimension,
         test_get_dimension_config_dict,
         test_fallback_dimension,
+        test_material_domain_zh_nonempty,
         test_nonexistent_domain_falls_back,
     ]
     passed = 0

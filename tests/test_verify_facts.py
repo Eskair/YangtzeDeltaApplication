@@ -13,6 +13,7 @@ from src.tools.verify_facts import (
     compute_entity_coverage,
     compute_numeric_accuracy,
     verify_single_fact,
+    _expand_cn_amount_tokens,
 )
 
 
@@ -71,6 +72,19 @@ def test_numeric_accuracy_fabricated():
     accuracy, suspect = compute_numeric_accuracy(fact, source)
     assert accuracy < 1.0
     assert suspect is True
+
+
+def test_numeric_accuracy_wan_vs_arabic():
+    """中文「万」与阿拉伯金额在原文中混写时仍应判为匹配。"""
+    fact = "本轮融资额为3000万元，对应投后估值约3亿元。"
+    source = "公司披露融资30000000元，投后估值300000000人民币。"
+    accuracy, suspect = compute_numeric_accuracy(fact, source)
+    assert accuracy >= 0.5
+
+
+def test_expand_cn_amount_tokens():
+    assert "30000000" in _expand_cn_amount_tokens("融资3000万元")
+    assert "300000000" in _expand_cn_amount_tokens("估值3亿元")
 
 
 def test_verify_single_fact_verified():

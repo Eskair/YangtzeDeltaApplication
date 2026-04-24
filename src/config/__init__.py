@@ -20,6 +20,8 @@ Usage:
     cfg.valid_types              # ["team_member", "org_structure", ...]
     cfg.get_dimension("team")    # DimensionConfig object
     cfg.get_type_to_dims_map()   # {"team_member": ["team"], ...}
+    cfg.material_domain_zh       # 与 extract / build_dimensions 共用的中文材料语域说明（YAML 可覆盖）
+    material_domain_zh_for_prompts()  # 供流水线脚本注入提示词，避免多处硬编码漂移
 """
 
 import os
@@ -68,6 +70,8 @@ class DomainConfig:
     dimensions: List[DimensionConfig]
     fact_types: List[FactTypeConfig]
     fallback_dimension: str = "feasibility"
+    # 与 extract_facts / build_dimensions 等共用的「材料语域」中文说明（default.yaml 的 material_domain_zh）
+    material_domain_zh: str = ""
 
     @property
     def dimension_names(self) -> List[str]:
@@ -121,6 +125,12 @@ class DomainConfig:
 _CONFIG_DIR = Path(__file__).resolve().parent
 _config_cache: Dict[str, DomainConfig] = {}
 
+# 当 YAML 未配置 material_domain_zh 时的兜底（与 default.yaml 建议内容保持一致）
+DEFAULT_MATERIAL_DOMAIN_ZH = (
+    "各类商业项目评审材料（投融资计划书、可行性研究、招标与响应文件、公司介绍、备忘录等），行业不限。\n"
+    "中文或以中文为主、中英混排较为常见；若为纯外文、临床方案、科研课题等，仅以原文为准，勿套用未出现的商业要素。"
+)
+
 
 def _load_domain_yaml(domain: str) -> Dict[str, Any]:
     """Load a domain YAML config file."""
@@ -165,11 +175,16 @@ def _parse_config(domain: str, data: Dict[str, Any]) -> DomainConfig:
             mapped_dimensions=t.get("mapped_dimensions", []),
         ))
 
+    raw_md = (data.get("material_domain_zh") or "").strip()
+    if not raw_md:
+        raw_md = DEFAULT_MATERIAL_DOMAIN_ZH.strip()
+
     return DomainConfig(
         domain_name=domain,
         dimensions=dimensions,
         fact_types=fact_types,
         fallback_dimension=data.get("fallback_dimension", "feasibility"),
+        material_domain_zh=raw_md,
     )
 
 
@@ -200,78 +215,78 @@ def get_config(domain: Optional[str] = None) -> DomainConfig:
 
 
 def _build_hardcoded_default() -> DomainConfig:
-    """Build a default config matching the original codebase's hardcoded values."""
+    """YAML 缺失时的兜底：与 default.yaml 一致的通用评审语义骨架。"""
     dimensions = [
         DimensionConfig(
             name="team", label_zh="团队与治理", label_en="Team & Governance",
             description="Team composition, individual backgrounds, institutional affiliations, roles, collaboration",
-            focus_zh="关注团队组成、核心负责人履历、跨机构合作网络、以及团队稳定性和时间投入。",
+            focus_zh="通用评审骨架：执行主体是否清晰；关键角色能力与分工；治理与外部协作是否支撑披露目标（以材料为准，不预设行业）。",
             focus_en="Team composition, leadership experience, collaboration network, stability",
             min_questions=6, max_questions=9, weight=1.0,
             aspects=[
-                AspectConfig("leadership_experience", "项目负责人的领导经验与往期重大项目执行记录"),
-                AspectConfig("domain_expertise", "团队在目标领域的专业深度"),
-                AspectConfig("collaboration_network", "合作机构、产业伙伴网络及互补性"),
-                AspectConfig("governance_and_decision_making", "项目治理结构、决策机制、质量控制"),
-                AspectConfig("team_capacity_and_bandwidth", "团队当前人力负荷与资源投入能力"),
+                AspectConfig("leadership_experience", "牵头人/负责人对同类或同规模任务的执行记录与可核验证据（材料已披露部分）"),
+                AspectConfig("domain_expertise", "团队能力与任务范围的匹配度：知识深度、资质与关键技能覆盖（材料已披露部分）"),
+                AspectConfig("collaboration_network", "外部协作与关键依赖：合作方角色、互补性与集中度风险（材料已披露部分）"),
+                AspectConfig("governance_and_decision_making", "治理与决策：分工授权、决策链、质量与合规内控安排（材料已披露部分）"),
+                AspectConfig("team_capacity_and_bandwidth", "投入与承载：人力/时间/管理带宽与阶段目标的匹配（材料已披露部分）"),
             ],
         ),
         DimensionConfig(
             name="objectives", label_zh="项目目标", label_en="Objectives",
             description="Overall goals, milestones, KPIs, sub-project targets",
-            focus_zh="关注项目总体目标的清晰度、分阶段里程碑、可量化指标和可实现性。",
+            focus_zh="通用评审骨架：目标是否可检验；阶段结果与成功判据；范围边界与优先级；与约束条件的自洽性（以材料为准）。",
             focus_en="Goal clarity, milestones, measurable metrics, achievability",
             min_questions=6, max_questions=9, weight=1.0,
             aspects=[
-                AspectConfig("overall_goal_clarity", "总体目标是否明确、聚焦"),
-                AspectConfig("milestones_and_timeline", "各阶段里程碑的设计是否合理可执行"),
-                AspectConfig("outcome_and_success_metrics", "是否有清晰可量化的成功指标"),
-                AspectConfig("scope_and_prioritization", "项目范围和优先级排序"),
-                AspectConfig("realism_and_ambition_balance", "目标在雄心和可行性之间的平衡"),
+                AspectConfig("overall_goal_clarity", "总体目标陈述是否明确、可界定成功/失败（材料已披露部分）"),
+                AspectConfig("milestones_and_timeline", "阶段划分与时间节点是否具体、可执行与可检查（材料已披露部分）"),
+                AspectConfig("outcome_and_success_metrics", "成功判据与测度：指标、口径与证据来源是否交代清楚（材料已披露部分）"),
+                AspectConfig("scope_and_prioritization", "范围边界与不做什么；资源约束下的优先级取舍（材料已披露部分）"),
+                AspectConfig("realism_and_ambition_balance", "目标强度与可得资源、外部环境之间的一致性（材料已披露部分）"),
             ],
         ),
         DimensionConfig(
             name="strategy", label_zh="实施路径与战略", label_en="Strategy",
             description="Technical approach, development path, market strategy, partnerships, operations",
-            focus_zh="关注技术路线设计、市场与商业化路径、合作伙伴策略和资源利用方式。",
+            focus_zh="通用评审骨架：主路径与备选；对外价值实现与关键接口；合作与资源编排；证据与合规边界（以材料为准，不预设单一业态）。",
             focus_en="Technical approach, market entry, partnership strategy, resource utilization",
             min_questions=7, max_questions=10, weight=1.0,
             aspects=[
-                AspectConfig("technical_strategy", "技术路线的合理性与替代方案"),
-                AspectConfig("commercialization_and_market_entry", "商业化模式、定价与市场进入路径"),
-                AspectConfig("partnership_and_business_model", "合作模式（授权、共同开发、服务等）"),
-                AspectConfig("data_and_evidence_strategy", "数据利用策略及隐私合规安排"),
-                AspectConfig("scaling_and_globalization", "从验证到大规模推广的扩展策略"),
+                AspectConfig("technical_strategy", "主方案与备选方案：方法选择、关键假设与依赖（材料已披露部分）"),
+                AspectConfig("commercialization_and_market_entry", "价值到达路径：客户/用户/采购或付费关系、渠道与交付形态（材料已披露部分；无则评信息缺口）"),
+                AspectConfig("partnership_and_business_model", "合作与交易结构：权责、收益分配、排他与退出（材料已披露部分）"),
+                AspectConfig("data_and_evidence_strategy", "关键结论所依赖的数据、来源、留存与合规/保密边界（材料已披露部分）"),
+                AspectConfig("scaling_and_globalization", "扩张或跨区域/跨场景推广的前提、节奏与约束（材料已披露部分）"),
             ],
         ),
         DimensionConfig(
             name="innovation", label_zh="技术与产品创新", label_en="Innovation",
             description="Novelty, differentiation, IP, evidence strength, extensibility",
-            focus_zh="关注技术/产品相对现有方案的创新性、差异化优势、知识产权布局和证据支撑。",
+            focus_zh="通用评审骨架：相对基准的差异；可辩护优势；保护与证据链；可扩展边界与外部替代风险（以材料为准）。",
             focus_en="Novelty vs state of art, differentiation, IP protection, evidence strength",
             min_questions=6, max_questions=9, weight=1.10,
             aspects=[
-                AspectConfig("novelty_vs_state_of_art", "相对当前前沿方案的真正创新点"),
-                AspectConfig("differentiation_and_competitive_edge", "与替代方案相比的明确优势"),
-                AspectConfig("ip_and_protection", "专利/数据资产的保护布局"),
-                AspectConfig("evidence_strength_for_innovation", "创新点的实验/验证证据强度"),
-                AspectConfig("platform_and_extensibility", "是否构成可拓展的平台或仅单点创新"),
-                AspectConfig("risk_of_obsolescence", "技术在3-5年内被替代的风险评估"),
+                AspectConfig("novelty_vs_state_of_art", "相对行业/惯例或对标基准的实质性差异点（材料已披露部分）"),
+                AspectConfig("differentiation_and_competitive_edge", "可辩护的差异化要点及与替代方案的关系（材料已披露部分）"),
+                AspectConfig("ip_and_protection", "可保护知识与合规资产：权利、合同安排、排他或关键 know-how（材料已披露部分）"),
+                AspectConfig("evidence_strength_for_innovation", "主张的支撑强度：验证设计、样本、独立性与可复核性（材料已披露部分）"),
+                AspectConfig("platform_and_extensibility", "方案的复用边界、接口与生态位：是否具备可扩展结构（材料已披露部分）"),
+                AspectConfig("risk_of_obsolescence", "外部变化下被替代、淘汰或规则变化的主要风险与窗口（材料已披露部分）"),
             ],
         ),
         DimensionConfig(
             name="feasibility", label_zh="资源与可行性", label_en="Feasibility",
             description="Resources, budget, implementation path, risks, timeline",
-            focus_zh="关注资源与基础设施、资金与预算、实施路径、关键风险和应对措施、落地可行性。",
+            focus_zh="通用评审骨架：资源与预算；执行编排；风险与缓解；关键障碍与时间—投入节拍（以材料为准）。",
             focus_en="Resources, funding, implementation path, risk management, timeline feasibility",
             min_questions=7, max_questions=10, weight=1.20,
             aspects=[
-                AspectConfig("resources_and_infrastructure", "资源平台是否充足且可长期稳定使用"),
-                AspectConfig("funding_and_budget_planning", "资金来源多样性、预算分配合理性"),
-                AspectConfig("operational_execution_plan", "实施路径是否具体清晰"),
-                AspectConfig("risk_management", "对各类风险的识别与缓解措施"),
-                AspectConfig("implementation_barriers", "在实际场景中落地的阻力"),
-                AspectConfig("timeline_and_resource_alignment", "时间表与资源投入是否匹配"),
+                AspectConfig("resources_and_infrastructure", "关键资源与基础设施的可得性、独占性与持续性（材料已披露部分）"),
+                AspectConfig("funding_and_budget_planning", "资金与预算结构：来源、用途、集中度与缓冲（材料已披露部分）"),
+                AspectConfig("operational_execution_plan", "从计划到落地的步骤、责任主体与关键路径（材料已披露部分）"),
+                AspectConfig("risk_management", "主要风险与监测指标；缓解与预案是否对应（材料已披露部分）"),
+                AspectConfig("implementation_barriers", "实施障碍：监管、供应链、组织、数据或外部依赖等（材料已披露部分）"),
+                AspectConfig("timeline_and_resource_alignment", "时间表与投入节拍、里程碑与资源曲线是否自洽（材料已披露部分）"),
             ],
         ),
     ]
@@ -302,7 +317,16 @@ def _build_hardcoded_default() -> DomainConfig:
         dimensions=dimensions,
         fact_types=fact_types,
         fallback_dimension="feasibility",
+        material_domain_zh=DEFAULT_MATERIAL_DOMAIN_ZH.strip(),
     )
+
+
+def material_domain_zh_for_prompts(domain: Optional[str] = None) -> str:
+    """Shared Chinese material-domain blurb for LLM prompts (extract, build_dimensions, …)."""
+    try:
+        return get_config(domain).material_domain_zh.strip() or DEFAULT_MATERIAL_DOMAIN_ZH.strip()
+    except Exception:
+        return DEFAULT_MATERIAL_DOMAIN_ZH.strip()
 
 
 def clear_cache() -> None:

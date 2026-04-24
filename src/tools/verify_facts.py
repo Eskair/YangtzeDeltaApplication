@@ -6,6 +6,10 @@ Input:
   - src/data/extracted/<proposal_id>/raw_facts.jsonl  (Stage 1 output)
   - src/data/prepared/<proposal_id>/full_text.txt     (Stage 0 output)
 
+Chinese commercial PDFs: numerals may appear full-width, with Chinese comma thousands
+separators, or as produced by OCR. Matching normalizes some whitespace/punctuation; facts
+should still be phrased consistently with full_text when possible.
+
 Output:
   - src/data/extracted/<proposal_id>/verified_facts.jsonl
 
@@ -18,9 +22,19 @@ Verification goals:
 
 This is a lightweight, deterministic verifier (no LLM calls).
 It uses string overlap, numeric matching, and light fuzzy matching.
+Heuristics favor recall for faithful extractions: long-fact fuzzy (head/tail),
+substring containment boost, relaxed status thresholds, optional full-text
+window when meta offsets are missing.
+
+Optional: ``jieba`` (see requirements.txt) improves Chinese token overlap when
+the fact is CJK-heavy; if not installed or VERIFY_USE_JIEBA=0, regex tokens are used.
+Numeric checks normalize full-width digits/commas and expand common ``X万 / X亿 / X千万``
+patterns to Arabic substrings for matching. Pure Chinese numerals (e.g. 三千万元) are
+not expanded; keep those spellings aligned in extraction when possible.
 """
 
 import json
+import os
 import re
 import argparse
 from pathlib import Path
@@ -31,6 +45,90 @@ BASE_DIR = Path(__file__).resolve().parents[2]
 PREPARED_DIR = BASE_DIR / "src" / "data" / "prepared"
 EXTRACTED_DIR = BASE_DIR / "src" / "data" / "extracted"
 PROGRESS_FILE = BASE_DIR / "src" / "data" / "step_progress.json"
+
+try:
+    import jieba as _jieba_mod  # type: ignore
+except ImportError:
+    _jieba_mod = None
+
+
+def _jieba_enabled() -> bool:
+    if _jieba_mod is None:
+        return False
+    return os.getenv("VERIFY_USE_JIEBA", "1").strip().lower() not in ("0", "false", "no")
+
+
+_FW_DIGIT_TRANS = str.maketrans(
+    "０１２３４５６７８９，．",
+    "0123456789,.",
+)
+
+
+def _flatten_for_numeric_match(s: str) -> str:
+    """Normalize text for substring search of Arabic numerals (CN commercial PDFs)."""
+    t = (s or "").translate(_FW_DIGIT_TRANS)
+    for ch in (" ", ",", "，", "\u3000", "\xa0"):
+        t = t.replace(ch, "")
+    return t
+
+
+def _cjk_ratio(text: str) -> float:
+    if not text:
+        return 0.0
+    n = len(text)
+    cjk = sum(1 for c in text if "\u4e00" <= c <= "\u9fff")
+    return cjk / max(1, n)
+
+
+def _jieba_token_overlap(fact_text: str, source_text: str) -> float:
+    """Jaccard-style overlap on jieba tokens (CJK-friendly). Returns -1 if skipped."""
+    if not _jieba_enabled() or not fact_text or not source_text:
+        return -1.0
+
+    def _tok_set(raw: str) -> set:
+        out = set()
+        for w in _jieba_mod.lcut(raw):
+            w = w.strip().lower()
+            if len(w) < 2:
+                continue
+            if w.isascii() and w.isalpha() and len(w) < 3:
+                continue
+            out.add(w)
+        return out
+
+    ft = _tok_set(fact_text)
+    st = _tok_set(source_text)
+    if not ft:
+        return -1.0
+    inter = len(ft & st)
+    return inter / len(ft)
+
+
+def _expand_cn_amount_tokens(text: str) -> List[str]:
+    """
+    Add Arabic strings for patterns like 3千万、0.3亿、1200万 so they match other spellings in source.
+    """
+    if not text:
+        return []
+    extra: List[str] = []
+    t = text or ""
+
+    def _push(n: float) -> None:
+        if n == int(n) and n < 1e15:
+            extra.append(str(int(n)))
+        else:
+            s = f"{n:.6f}".rstrip("0").rstrip(".")
+            extra.append(s)
+
+    for m in re.finditer(r"(\d+(?:\.\d+)?)\s*千万", t):
+        _push(float(m.group(1)) * 1e7)
+    for m in re.finditer(r"(\d+(?:\.\d+)?)\s*百万", t):
+        _push(float(m.group(1)) * 1e6)
+    for m in re.finditer(r"(\d+(?:\.\d+)?)\s*万", t):
+        _push(float(m.group(1)) * 1e4)
+    for m in re.finditer(r"(\d+(?:\.\d+)?)\s*亿", t):
+        _push(float(m.group(1)) * 1e8)
+    return extra
 
 
 def _write_progress(done: int, total: int, pid: str = "") -> None:
@@ -113,6 +211,7 @@ def compute_text_overlap(fact_text: str, source_text: str) -> float:
     """
     Compute how much of the fact text overlaps with source text.
     Uses word-level token overlap normalized by fact length.
+    When the fact is CJK-heavy and jieba is available, also scores jieba token overlap and takes the max.
     """
     if not fact_text or not source_text:
         return 0.0
@@ -120,7 +219,7 @@ def compute_text_overlap(fact_text: str, source_text: str) -> float:
     fact_lower = fact_text.lower()
     source_lower = source_text.lower()
 
-    # Word-level tokens
+    # Word-level tokens (regex; contiguous CJK runs — coarse for paraphrase / 我司 vs 全称)
     fact_words = set(re.findall(r"[a-z]+|\d+|[\u4e00-\u9fff]+", fact_lower))
     source_words = set(re.findall(r"[a-z]+|\d+|[\u4e00-\u9fff]+", source_lower))
 
@@ -128,7 +227,13 @@ def compute_text_overlap(fact_text: str, source_text: str) -> float:
         return 0.0
 
     overlap = fact_words & source_words
-    return len(overlap) / len(fact_words)
+    base = len(overlap) / len(fact_words)
+
+    if _cjk_ratio(fact_text) >= 0.22:
+        j = _jieba_token_overlap(fact_text, source_text)
+        if j >= 0.0:
+            return min(1.0, max(base, j))
+    return base
 
 
 def compute_entity_coverage(fact_text: str, source_text: str) -> Tuple[float, List[str]]:
@@ -156,20 +261,53 @@ def compute_numeric_accuracy(fact_text: str, source_text: str) -> Tuple[float, b
     """
     Check whether numbers in the fact appear in the source text.
     Returns (accuracy_ratio, has_suspect_numbers).
+
+    Normalizes full-width digits / Chinese commas; expands 万/亿/千万等写法为阿拉伯数字串再匹配，
+    缓解「事实写 3000 万、原文写 3 千万」类 OCR/表述差异。
     """
-    fact_nums = extract_numbers(fact_text)
+    fact_nums = list(extract_numbers(fact_text))
+    fact_nums.extend(_expand_cn_amount_tokens(fact_text))
     if not fact_nums:
         return 1.0, False
 
-    source_flat = (source_text or "").replace(" ", "").replace(",", "")
-    found = 0
+    source_flat = _flatten_for_numeric_match(source_text)
+    seen = set()
+    unique: List[str] = []
     for num in fact_nums:
-        num_clean = num.replace(",", "")
-        if num_clean in source_flat:
+        num_clean = num.replace(",", "").replace("，", "")
+        if num_clean and num_clean not in seen:
+            seen.add(num_clean)
+            unique.append(num_clean)
+
+    found = 0
+    for num_clean in unique:
+        pct = num_clean.endswith("%")
+        core = num_clean[:-1] if pct else num_clean
+        if core in source_flat:
+            found += 1
+            continue
+        if pct and core in source_flat:
+            found += 1
+            continue
+        # 百分比：原文可能写作「数字 + 百分比号」全角
+        if pct and (core + "%" in source_text or core + "％" in source_text):
             found += 1
 
-    accuracy = found / len(fact_nums)
+    accuracy = found / max(1, len(unique))
     return accuracy, accuracy < 1.0
+
+
+def _collapse_ws(s: str) -> str:
+    return re.sub(r"\s+", "", (s or "").strip())
+
+
+def _fact_likely_from_source(fact_text: str, source_text: str) -> bool:
+    """True if fact (ignoring whitespace) appears as a contiguous substring of source."""
+    a = _collapse_ws(fact_text)
+    b = _collapse_ws(source_text)
+    if len(a) < 6:
+        return bool(a) and a in b
+    return a in b
 
 
 def fuzzy_substring_match(fact_text: str, source_text: str, threshold: float = 0.6) -> float:
@@ -205,6 +343,41 @@ def fuzzy_substring_match(fact_text: str, source_text: str, threshold: float = 0
     return best
 
 
+def _fuzzy_score_for_fact_length(fact_text: str, chunk_text: str) -> float:
+    """Head/tail windows so long facts are not penalized with fuzzy_score=0."""
+    fact_clean = (fact_text or "").strip()
+    if not fact_clean or not chunk_text:
+        return 0.0
+    if len(fact_clean) < 200:
+        return fuzzy_substring_match(fact_clean, chunk_text)
+    head = fact_clean[:200]
+    tail = fact_clean[-200:]
+    return max(
+        fuzzy_substring_match(head, chunk_text),
+        fuzzy_substring_match(tail, chunk_text),
+    )
+
+
+def _surrogate_chunk_from_fulltext(fact_text: str, full_text: str, margin: int = 500) -> str:
+    """
+    When meta offsets are missing, try to locate an early substring of the fact in full_text
+    and return a surrounding window as verification context.
+    """
+    if not fact_text or not full_text:
+        return ""
+    needle = fact_text.strip()[: min(80, len(fact_text.strip()))]
+    if len(needle) < 8:
+        return ""
+    idx = full_text.find(needle)
+    if idx < 0:
+        idx = full_text.find(needle.replace(" ", ""))
+    if idx < 0:
+        return ""
+    lo = max(0, idx - margin)
+    hi = min(len(full_text), idx + len(fact_text) + margin * 2)
+    return full_text[lo:hi]
+
+
 def get_chunk_text(fact: Dict[str, Any], full_text: str) -> str:
     """Extract the source chunk text for a given fact based on its meta offsets."""
     meta = fact.get("meta", {})
@@ -233,8 +406,12 @@ def verify_single_fact(fact: Dict[str, Any], full_text: str) -> Dict[str, Any]:
         return fact
 
     chunk_text = get_chunk_text(fact, full_text)
+    chunk_reason = "meta_offsets"
+    if not chunk_text and full_text:
+        chunk_text = _surrogate_chunk_from_fulltext(fact_text, full_text)
+        chunk_reason = "fulltext_surrogate" if chunk_text else "no_source_chunk"
+
     if not chunk_text:
-        # No source chunk available; can't verify
         fact["verification"] = {
             "status": "unverified",
             "score": 0.3,
@@ -251,23 +428,25 @@ def verify_single_fact(fact: Dict[str, Any], full_text: str) -> Dict[str, Any]:
     # 3. Numeric accuracy
     numeric_accuracy, has_suspect_nums = compute_numeric_accuracy(fact_text, chunk_text)
 
-    # 4. Fuzzy substring match (only for short facts to keep performance)
-    fuzzy_score = 0.0
-    if len(fact_text) < 200:
-        fuzzy_score = fuzzy_substring_match(fact_text, chunk_text)
+    # 4. Fuzzy match (head/tail for long facts — previously long facts always got 0 here)
+    fuzzy_score = _fuzzy_score_for_fact_length(fact_text, chunk_text)
 
-    # Composite score (weighted average)
+    # Composite: slightly less weight on entity_coverage (CJK 2–8 字碎片易误判缺失)
     score = (
-        0.35 * text_overlap
-        + 0.25 * entity_coverage
+        0.42 * text_overlap
+        + 0.18 * entity_coverage
         + 0.25 * numeric_accuracy
         + 0.15 * fuzzy_score
     )
 
-    # Determine status
-    if score >= 0.7:
+    # Strong signal: paraphrase-free alignment with chunk (typical of faithful extraction)
+    if _fact_likely_from_source(fact_text, chunk_text):
+        score = max(score, 0.58)
+
+    # Determine status (thresholds relaxed vs 0.7 / 0.4 to reduce false unverified)
+    if score >= 0.62:
         status = "verified"
-    elif score >= 0.4:
+    elif score >= 0.36:
         status = "partially_verified"
     else:
         status = "unverified"
@@ -281,6 +460,7 @@ def verify_single_fact(fact: Dict[str, Any], full_text: str) -> Dict[str, Any]:
     fact["verification"] = {
         "status": status,
         "score": round(score, 3),
+        "chunk_source": chunk_reason,
         "text_overlap": round(text_overlap, 3),
         "entity_coverage": round(entity_coverage, 3),
         "numeric_accuracy": round(numeric_accuracy, 3),

@@ -12,6 +12,14 @@ Stage 0: 文本准备 · prepare_proposal_text.py
 - 输出：
     - src/data/prepared/<proposal_id>/full_text.txt
     - src/data/prepared/<proposal_id>/pages.json （逐页文本 + 是否用 OCR + 全局偏移）
+
+多语言商业类 PDF 的常见技术说明（与行业无关；农业、制造、消费、金融、医疗企业、跨境项目等均适用）：
+- OCR 语言包由环境变量 TESS_LANG 控制（默认 chi_sim+eng，适合**中英混排、以中文为主**的材料）。
+  若材料以英文或其他语言为主，请改为 eng、deu 等 Tesseract 支持的语言包组合。
+- 栅格化分辨率见 OCR_DPI（默认 220）；扫描件、竖排、小字、复杂表格、章封面等可适当提高到 260–300，
+  代价是更慢、更占内存；纯矢量电子 PDF 可维持默认。
+- 表格与图片中的数字以 OCR/视觉模型识别结果为准，可能与原文排版略有出入；后续事实核验
+  与抽取阶段应以「本阶段写入 full_text 的形态」为准，全角/半角、千分位逗号等尽量保留 OCR 原文。
 """
 
 import os
@@ -49,11 +57,23 @@ def _write_progress(done: int, total: int, pid: str = "") -> None:
     except Exception:
         pass
 
-# 如果你有中文 OCR 数据，可以加 chi_sim
-# 常见配置："eng" / "chi_sim" / "chi_sim+eng"
+# TESS_LANG：按材料主语言配置，如 eng / chi_sim / chi_sim+eng（中英混排常见用 chi_sim+eng）
 TESSERACT_LANG = os.getenv("TESS_LANG", "chi_sim+eng")
-VISION_MODEL   = os.getenv("VISION_MODEL",  "gpt-4o")
+VISION_MODEL   = os.getenv("VISION_MODEL",  "gpt-5.2")
 ENABLE_VISION  = os.getenv("ENABLE_VISION", "true").strip().lower() == "true"
+
+
+def _ocr_dpi() -> int:
+    """PDF 转图 DPI：影响 OCR 与整页栅格化清晰度；过高会显著变慢、占内存。"""
+    raw = (os.getenv("OCR_DPI", "220") or "220").strip()
+    try:
+        d = int(raw)
+    except ValueError:
+        d = 220
+    return max(72, min(d, 400))
+
+
+OCR_DPI = _ocr_dpi()
 
 
 # ========== 文件类型识别 ==========
@@ -113,7 +133,8 @@ def ocr_page_from_pdf(pdf_path: Path, page_index: int) -> str:
         images = convert_from_path(
             str(pdf_path),
             first_page=page_index + 1,
-            last_page=page_index + 1
+            last_page=page_index + 1,
+            dpi=OCR_DPI,
         )
     except Exception as e:
         print(f"[WARN] convert_from_path 失败 (page {page_index+1}): {e}")
@@ -141,7 +162,8 @@ def describe_image_with_vision(pil_image, context_hint: str = "") -> str:
         pil_image.save(buf, format="PNG")
         b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
         prompt = (
-            "You are analyzing a page from a business/research proposal document. "
+            "You are analyzing a visual from a commercial project document (business plan, "
+            "investment memo, feasibility deck, tender, or similar — any industry or region). "
             "Describe ALL visual content present: charts, graphs (bar/line/pie/scatter), "
             "tables, figures, diagrams, flowcharts. Include key numbers, percentages, "
             "axis labels, legends, and any visible trends or conclusions. "
@@ -187,7 +209,7 @@ def extract_from_pdf(pdf_path: Path, use_ocr: bool = True, pid: str = ""):
 
     with pdfplumber.open(pdf_path) as pdf:
         num_pages = len(pdf.pages)
-        print(f"[INFO] PDF 页面数: {num_pages}")
+        print(f"[INFO] PDF 页面数: {num_pages}；OCR/整页栅格化 DPI={OCR_DPI}（可调环境变量 OCR_DPI）")
         _write_progress(0, num_pages, pid)
         for i, page in enumerate(pdf.pages):
             txt = page.extract_text() or ""
@@ -221,11 +243,14 @@ def extract_from_pdf(pdf_path: Path, use_ocr: bool = True, pid: str = ""):
                 print(f"  - 第 {i+1} 页: 发现 {len(page.images)} 个图像，调用视觉模型...", flush=True)
                 try:
                     page_imgs = convert_from_path(
-                        str(pdf_path), first_page=i + 1, last_page=i + 1, dpi=150
+                        str(pdf_path),
+                        first_page=i + 1,
+                        last_page=i + 1,
+                        dpi=OCR_DPI,
                     )
                     if page_imgs:
                         visual_desc = describe_image_with_vision(
-                            page_imgs[0], context_hint=f"Page {i+1} of proposal"
+                            page_imgs[0], context_hint=f"Page {i+1} of document"
                         )
                         if visual_desc:
                             pages_text[-1] = pages_text[-1] + f"\n[VISUAL CONTENT: {visual_desc}]"
@@ -253,7 +278,7 @@ def extract_from_docx(docx_path: Path):
                 blob = doc.part.related_parts[rId].blob
                 pil_image = Image.open(BytesIO(blob))
                 desc = describe_image_with_vision(
-                    pil_image, context_hint=f"Inline image {idx+1} from DOCX proposal"
+                    pil_image, context_hint=f"Inline image {idx+1} from DOCX document"
                 )
                 if desc:
                     visual_parts.append(f"[VISUAL CONTENT: {desc}]")
@@ -299,7 +324,7 @@ def extract_from_pptx(pptx_path: Path, pid: str = ""):
                         pil_image = Image.open(BytesIO(blob))
                         desc = describe_image_with_vision(
                             pil_image,
-                            context_hint=f"Slide {slide_idx + 1} image from PowerPoint proposal"
+                            context_hint=f"Slide {slide_idx + 1} image from PowerPoint document"
                         )
                         if desc:
                             visual_parts.append(f"[VISUAL CONTENT: {desc}]")

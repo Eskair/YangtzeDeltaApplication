@@ -8,7 +8,7 @@ Stage 2 · 维度构建器（build_dimensions_from_facts.py）
 输出：
   - src/data/extracted/<proposal_id>/dimensions_v2.json      （新的五维度文件）
   - src/data/extracted/<proposal_id>/dimension_facts.json    （按维度分组的 facts，方便后续调试与复用）
-  - src/data/parsed/parsed_dimensions.clean.llm.json         （供 llm_answering 使用的全局 parsed 文件）
+  - src/data/parsed/<proposal_id>/parsed_dimensions.clean.llm.json  （按提案隔离；并行多项目时勿混用）
 
 核心职责：
   - 按 dimensions 标签把 facts 分桶到 team/objectives/strategy/innovation/feasibility
@@ -16,6 +16,8 @@ Stage 2 · 维度构建器（build_dimensions_from_facts.py）
       summary / key_points / risks / mitigations
   - 严禁凭空造事实，所有内容必须能在事实列表中找到“影子”
   - 尽量覆盖该维度下出现过的不同 type（team_member/pipeline/market/risk/...）
+  - 提示词面向各类商业项目评审：审批友好书面语；strategy/feasibility 强调收入模式、现金流、合规与数据安全等；
+    risk 关键词含常见委婉表述（挑战、依赖、尚待验证等）。
 """
 
 import os
@@ -35,7 +37,7 @@ EXTRACTED_DIR = BASE_DIR / "src" / "data" / "extracted"
 PARSED_DIR = BASE_DIR / "src" / "data" / "parsed"   # 与 llm_answering 对齐
 PROGRESS_FILE = BASE_DIR / "src" / "data" / "step_progress.json"
 
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.2")
 
 
 def _write_progress(done: int, total: int, pid: str = "") -> None:
@@ -79,7 +81,11 @@ def _get_client():
 # 注意：这里用 {dimension_name} 标记占位，其它所有 { } 都是字面量 JSON 示例
 # 后面用 .replace("{dimension_name}", xxx) 而不是 .format()
 DIMENSION_PROMPT_TEMPLATE = """
-你是一个严谨的项目评审助手，现在要基于【已经抽取好的事实列表】为某一个维度生成结构化摘要。
+你是一个严谨的项目评审专家，面向以下【材料语域】的审批场景，
+现在要基于【已经抽取好的事实列表】为某一个维度生成结构化摘要。
+
+【材料语域（与 src/config 共用；与 extract_facts_by_chunk 一致）】
+__MATERIAL_DOMAIN_ZH_PLACEHOLDER__
 
 ⚠️ 最重要的硬性约束（请逐条遵守）：
 1）你只能使用我给你的事实列表中的信息，不得凭空添加任何新的机构、人名、疾病、药物、技术、模型、
@@ -92,9 +98,15 @@ DIMENSION_PROMPT_TEMPLATE = """
 4）你只能总结【当前维度】的内容，可以顺带提及与该维度强相关的信息，
    但不要跑题到其他维度上去写泛泛而谈的评价。
 
+【输出语体（审批友好）】
+- summary 与 key_points 一律使用**客观、克制的中文书面语**，便于材料复核与审批阅读。
+- **禁止**使用夸张或营销腔措辞（例如「必将」「颠覆」「唯一」「绝对领先」「史无前例」等），
+  **除非**这些词在事实原文中已出现且你在忠实概括。
+- 优先使用「材料显示」「事实表明」「提案披露」类中性表述，避免空泛吹捧或结论先行。
+
 【当前维度】：{dimension_name}
 
-【该维度的代表性内容示例】（只是提醒你关注点，不是让你照抄）：
+【该维度的代表性内容示例】（只是提醒你关注点，不是让你照抄；面向各类商业与投资项目材料，而非学术论文或宣传通稿）：
 - team:
   - 核心团队成员、机构、职称、研究方向、项目角色
   - 组织结构、国内外团队协同、分工比例
@@ -102,18 +114,20 @@ DIMENSION_PROMPT_TEMPLATE = """
 - objectives:
   - 总体目标（3–5 年想达到什么）
   - 分阶段里程碑（0–6/6–12/12–18/18–36 个月等）
-  - 各条管线/子项目的目标
+  - 各条产品线/业务线或子项目的目标（若事实为医疗管线则据实概括）
 - strategy:
-  - 技术路线（包括 AI/算法/实验路径）
-  - 合作策略、商业模式、市场进入方案
-  - 运营与国内外协同策略、监管路径
+  - 技术路线（含 AI/算法/数字化交付路径）与产品化节奏
+  - **收入模式**（订阅/交易抽成/项目制等）、**定价与渠道**、**市场进入与 GTM**
+  - **单店/单客户经济模型**、**获客成本与回款**、合作与供应链策略
+  - **合规与数据安全**、行业监管与上市路径中与**经营策略**相关的事实
 - innovation:
   - 技术/产品/模式的创新点
   - 相比现有方案的优势
   - 关键专利、独特数据/资源、验证证据
 - feasibility:
-  - 资源基础（实验室、平台、合作方）
-  - 预算和资金规划、资金来源
+  - 资源基础（实验室、平台、合作方、产能与交付）
+  - **现金流**、**预算与融资用途**、费用与毛利结构（若事实中有）
+  - **合规、数据安全与内控**、关键人依赖与供应链韧性
   - 风险矩阵及应对措施（技术、市场、资金、法规等）
   - 时间表、实施路径、资源约束等可行性因素
 
@@ -144,9 +158,9 @@ payload = {
 2) 按下面格式输出一个 JSON 对象：
 
 {
-  "summary": "string，2-4 句中文，总结该维度的整体情况（必须是基于 facts 的压缩总结，而不是空泛评价）",
+  "summary": "string，2-4 句中文，审批友好书面语，总结该维度整体情况（须基于 facts 压缩，不空评）",
   "key_points": [
-    "string，要点 1（尽量具体，能在至少一条 fact 中找到影子）",
+    "string，要点 1（具体、克制，能在至少一条 fact 中找到影子）",
     "string，要点 2",
     "... 在事实足够多时，尽量输出 6-10 条互相不重复的要点。"
   ],
@@ -175,9 +189,11 @@ payload = {
   例如：
   - team: 如果既有团队成员信息（team_member），又有组织结构（org_structure）、协作模式（collaboration），请三类都各写至少 1 条；
   - objectives: 如果既有总体目标（用 pipeline/product/milestone 描述），又有阶段里程碑（milestone），请都覆盖；
-  - strategy: 如果既有技术路线（tech_route），又有市场/客户（market）、合作/商业模式（collaboration/funding_source）、监管路径（regulatory），请都覆盖；
+  - strategy: 若事实中同时出现技术路线（tech_route）、市场/客户（market）、**收入与渠道/GTM**、
+    合作与资金（collaboration/funding_source）、**合规与数据安全**（regulatory）等，请都尽量覆盖，避免写成纯论文式技术综述；
   - innovation: 请优先包括创新点（ip_asset/ai_model/tech_route）以及已有证据（evidence）；
-  - feasibility: 请尽量包括资源/能力（resource）、预算/资金（budget_item/funding_source）以及风险与应对（risk/mitigation），如有时间表/实施难度也可以提及。
+  - feasibility: 请尽量包括资源/能力（resource）、**现金流与预算/融资**（budget_item/funding_source）、
+    **合规与数据安全**、风险与应对（risk/mitigation），以及时间表/实施难度等（以事实为准）。
 
 【关于风险与应对的约束】
 - 在生成 "risks" 时，请优先基于 risk_facts 中的事实进行归纳；
@@ -186,6 +202,7 @@ payload = {
 
 补充要求：
 - 不要写“根据常识”“业内通常如何如何”这种话，只能说提案文本展示出来的内容。
+- 全文语气保持**正式评审材料**语境：像给投资决策、立项复核、采购评标或监管报送用的摘要，而不是学术论文或宣传通稿。
 - 不要输出任何 JSON 以外的文字（不要解释、不要加注释）。
 """
 
@@ -296,13 +313,20 @@ def sort_facts_for_dimension(dimension_name: str, facts: List[Dict[str, Any]]) -
     def type_rank(t: str) -> int:
         return order.index(t) if t in order else len(order)
 
+    def ver_score(f: Dict[str, Any]) -> float:
+        v = f.get("verification") or {}
+        if isinstance(v, dict):
+            return float(v.get("score") or 0.0)
+        return 0.0
+
+    # type 优先；同 type 内用核验分作 tie-break，避免高价值句因启发式 unverified 被排到截断外
     return sorted(
         facts,
-        key=lambda f: type_rank(f.get("type", "other"))
+        key=lambda f: (type_rank(f.get("type", "other")), -ver_score(f)),
     )
 
 
-def truncate_facts_for_prompt(facts: List[Dict[str, Any]], max_chars: int = 10000) -> List[Dict[str, Any]]:
+def truncate_facts_for_prompt(facts: List[Dict[str, Any]], max_chars: int = 12000) -> List[Dict[str, Any]]:
     """
     为了防止单次 prompt 爆 context，对 facts 做一个简单的字符长度截断。
     按顺序累加 text，超过 max_chars 就停（meta 仍然保留）。
@@ -321,7 +345,17 @@ def truncate_facts_for_prompt(facts: List[Dict[str, Any]], max_chars: int = 1000
 
 # ===== 辅助：基于文本再兜底识别 risk / mitigation =====
 
-_RISK_CN = ["风险", "挑战", "瓶颈", "不确定性", "不足", "局限", "缺陷", "障碍", "难点"]
+_RISK_CN = [
+    "风险", "挑战", "瓶颈", "不确定性", "不足", "局限", "缺陷", "障碍", "难点",
+    "依赖", "依赖度", "集中度", "单一客户", "第一大客户", "客户集中",
+    "承压", "波动", "下滑", "放缓", "收紧", "恶化", "回落",
+    "短板", "薄弱", "薄弱环节", "隐忧", "顾虑", "担忧",
+    "尚待", "有待", "尚不明确", "存在不确定性", "尚需验证", "待验证",
+    "同质化", "价格战", "红海", "竞争加剧",
+    "敏感", "脆弱", "波动较大", "不及预期",
+    "合规风险", "数据安全", "泄露", "处罚", "诉讼",
+    "现金流紧张", "垫资", "回款周期", "账期延长", "应收账款",
+]
 _RISK_EN = ["risk", "risks", "challenge", "challenges", "bottleneck", "bottlenecks",
             "uncertainty", "limitation", "limitations", "weakness", "weaknesses",
             "barrier", "barriers", "issue", "issues", "difficulty", "difficulties"]
@@ -403,7 +437,7 @@ def call_llm_for_dimension(dimension_name: str, facts: List[Dict[str, Any]]) -> 
 
     # 1) 先按 type 排序，再截断，确保更重要的信息优先被看到
     sorted_facts = sort_facts_for_dimension(dimension_name, facts)
-    all_facts_for_prompt = truncate_facts_for_prompt(sorted_facts, max_chars=10000)
+    all_facts_for_prompt = truncate_facts_for_prompt(sorted_facts, max_chars=12000)
 
     # 2) 识别风险 / 对策 facts：不仅看 type，还看文本关键词
     risk_facts: List[Dict[str, Any]] = []
@@ -429,12 +463,23 @@ def call_llm_for_dimension(dimension_name: str, facts: List[Dict[str, Any]]) -> 
     facts_json_str = json.dumps(payload, ensure_ascii=False, indent=2)
 
     # 用 replace，而不是 format，避免 JSON 里的 { } 被当成占位符
-    prompt = DIMENSION_PROMPT_TEMPLATE.replace("{dimension_name}", dimension_name)
+    try:
+        from src.config import material_domain_zh_for_prompts
+
+        md = material_domain_zh_for_prompts()
+    except Exception:
+        md = ""
+    prompt = (
+        DIMENSION_PROMPT_TEMPLATE.replace("{dimension_name}", dimension_name).replace(
+            "__MATERIAL_DOMAIN_ZH_PLACEHOLDER__", md.strip() or "（材料语域未配置，仅以事实列表为准。）"
+        )
+    )
 
     messages = [
         {
             "role": "system",
-            "content": "你是一个严谨的项目评审助手，只能基于给定的事实列表进行总结，不得编造。适用于任何领域的项目提案。",
+            "content": "你是一个严谨的项目评审助手，只能基于给定的事实列表进行总结，不得编造。"
+            "典型材料为各类商业与投融资书面材料（不限行业）：输出须客观、克制、审批友好；除非事实原文已有，避免夸张营销措辞。",
         },
         {
             "role": "user",
@@ -562,9 +607,11 @@ def run_build(proposal_id: str):
     )
     print(f"\n[OK] 新版五维度文件已生成: {out_path}")
 
-    # 2) 同时写一份全局 parsed 文件给 llm_answering 用
+    # 2) 按 proposal_id 写入 parsed，避免并行评审多个项目时互相覆盖（旧版单文件仍兼容读取，见 search_by_dimension）
     PARSED_DIR.mkdir(parents=True, exist_ok=True)
-    parsed_path = PARSED_DIR / "parsed_dimensions.clean.llm.json"
+    parsed_sub = PARSED_DIR / pid
+    parsed_sub.mkdir(parents=True, exist_ok=True)
+    parsed_path = parsed_sub / "parsed_dimensions.clean.llm.json"
 
     parsed_obj = {
         dim: {

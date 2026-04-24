@@ -156,14 +156,20 @@ def _inject_fallbacks(dimension: str, entities: list, keywords: list):
             outs.append(tpl.replace("{KEY}", toks[0]))
     return uniq(outs)
 
-# ---- 新增：读取并展开 generated_questions.json 的 query_templates ----
-def load_query_templates():
-    qset_path = CONFIG_DIR / "question_sets" / "generated_questions.json"
-    try:
-        raw = json.loads(qset_path.read_text(encoding="utf-8"))
-        return raw.get("query_templates", {}) or {}
-    except Exception:
-        return {}
+# ---- 读取 generated_questions.json 的 query_templates（per-proposal 优先） ----
+def load_query_templates(proposal_id: str = "") -> dict:
+    pid = (proposal_id or "").strip() or (os.getenv("CURRENT_PROPOSAL_ID") or "").strip()
+    candidates = []
+    if pid:
+        candidates.append(DATA_DIR / "questions" / pid / "generated_questions.json")
+    candidates.append(CONFIG_DIR / "question_sets" / "generated_questions.json")
+    for qset_path in candidates:
+        try:
+            raw = json.loads(qset_path.read_text(encoding="utf-8"))
+            return raw.get("query_templates", {}) or {}
+        except Exception:
+            continue
+    return {}
 
 def expand_templates_for_dim(dimension: str, templates: list, entities: list, key_terms: list, numbers: list, time_hint: str):
     people = [e for e in entities if e]
@@ -258,30 +264,46 @@ def build_base_clause(dim_name: str, qcfg: dict, qsets_meta: dict):
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--fast", action="store_true", help="仅检索每维前2个问题（调试模式）")
+parser.add_argument(
+    "--proposal_id",
+    type=str,
+    default="",
+    help="提案 ID，对应 src/data/parsed/<proposal_id>/parsed_dimensions.clean.llm.json；默认取 extracted 下最新目录",
+)
 args = parser.parse_args()
 
-# 1) 读取清洗后的维度（固定路径）
-parsed_path = PARSED_DIR / "parsed_dimensions.clean.llm.json"
+# 1) 读取清洗后的维度（按 proposal_id 分文件；兼容旧版根目录单文件）
+def _resolve_proposal_id_for_search() -> str:
+    pid = (args.proposal_id or "").strip() or os.getenv("CURRENT_PROPOSAL_ID", "").strip()
+    if pid:
+        return pid
+    if PROPOSAL_DIR.exists():
+        subs = [d for d in PROPOSAL_DIR.iterdir() if d.is_dir()]
+        if subs:
+            return max(subs, key=lambda x: x.stat().st_mtime).name
+    return "current_proposal"
+
+
+proposal_id = _resolve_proposal_id_for_search()
+parsed_path = PARSED_DIR / proposal_id / "parsed_dimensions.clean.llm.json"
 if not parsed_path.exists():
-    print(f"❌ 未找到清洗后的维度文件：{parsed_path}；请先运行 strict_cleanup_llm.py")
-    sys.exit(1)
+    legacy = PARSED_DIR / "parsed_dimensions.clean.llm.json"
+    if legacy.exists():
+        parsed_path = legacy
+        print(f"[WARN] 使用旧版全局维度文件: {legacy}；建议重新运行 build_dimensions_from_facts 生成分提案路径。")
+    else:
+        print(
+            f"❌ 未找到清洗后的维度文件：{PARSED_DIR / proposal_id / 'parsed_dimensions.clean.llm.json'}；"
+            f"请先运行 build_dimensions_from_facts.py（或传入 --proposal_id）"
+        )
+        sys.exit(1)
 
 try:
     dimensions = json.loads(parsed_path.read_text(encoding="utf-8"))
 except Exception as e:
     print(f"❌ 读取维度文件失败：{e}"); sys.exit(1)
 
-# 2) 读取问题集（固定路径）
-qset_path = CONFIG_DIR / "question_sets" / "generated_questions.json"
-if not qset_path.exists():
-    print(f"❌ 未找到问题集：{qset_path}"); sys.exit(1)
-try:
-    question_sets = json.loads(qset_path.read_text(encoding="utf-8"))
-except Exception as e:
-    print(f"❌ 读取问题集失败：{e}"); sys.exit(1)
-
-# 3) 从 run_meta.source_path 恢复 proposal_id
-proposal_id = "current_proposal"
+# 2) 与维度 JSON 内 run_meta 对齐 proposal_id（须在读取问题集之前）
 try:
     src_path = (dimensions.get("run_meta") or {}).get("source_path", "")
     if src_path:
@@ -290,8 +312,30 @@ try:
             proposal_id = p.stem.replace("_dimensions", "")
 except Exception:
     pass
+
+# 3) 读取问题集：优先 data/questions/<proposal_id>/generated_questions.json，回退全局副本
+_per_pid_qs = DATA_DIR / "questions" / proposal_id / "generated_questions.json"
+_legacy_qs = CONFIG_DIR / "question_sets" / "generated_questions.json"
+if _per_pid_qs.exists():
+    qset_path = _per_pid_qs
+elif _legacy_qs.exists():
+    qset_path = _legacy_qs
+    print(f"[WARN] 未找到 {_per_pid_qs}，使用旧版全局问题集: {_legacy_qs}")
+else:
+    print(
+        f"❌ 未找到问题集。请先运行 generate_questions.py。\n"
+        f"  已尝试: {_per_pid_qs}\n"
+        f"  已尝试: {_legacy_qs}"
+    )
+    sys.exit(1)
+try:
+    question_sets = json.loads(qset_path.read_text(encoding="utf-8"))
+except Exception as e:
+    print(f"❌ 读取问题集失败：{e}"); sys.exit(1)
+
 os.environ["CURRENT_PROPOSAL_ID"] = proposal_id
 print(f"📂 当前提案文件: {proposal_id}")
+print(f"📋 问题集: {qset_path}")
 
 EVIDENCE_DIR = EVIDENCE_ROOT / proposal_id
 EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
